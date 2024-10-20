@@ -26,7 +26,7 @@ NUM_NODES=4
 wandb online
 
 
-NCCL_DEBUG=ERROR deepspeed --num_gpus=$GPUS --num_nodes=$NUM_NODES ft_llm.py \
+NCCL_DEBUG=ERROR deepspeed ft_llm.py \
         --base_model   $BASE_MODEL \
         --data_path 'data/nli_for_simcse.csv' \
         --batch_size $BATCH_SIZE \
@@ -42,5 +42,6 @@ NCCL_DEBUG=ERROR deepspeed --num_gpus=$GPUS --num_nodes=$NUM_NODES ft_llm.py \
         --deepspeed ds.config \
         --lora_target_modules q_proj,k_proj,v_proj,o_proj,gate_proj,down_proj,up_proj  --logging_steps 1 --grad_checkpoint \
          --load_kbit $BIT \
+         --bf16 true \
          ${args[@]}
 

@@ -190,7 +190,7 @@ def init_model_and_transform(lora_path, bf16, fp32, use_e5v=False):
     model_name = "llava-hf/llava-v1.6-mistral-7b-hf"
 
     if MODEL_TYPE == 'llava_llama3':
-        model_name = "./llava-llama-3-8b"
+        model_name = "models/llava-llama-3-8b"
 
     if lora_path is not None:
         merge_path = 'merged-' + lora_path.replace('/', '-').replace('.', '')

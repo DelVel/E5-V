@@ -1,0 +1,7 @@
+**/__pycache__
+/data/nli_for_simcse.csv
+/e5v-8b*
+/merged-e5v-8b*
+/models
+/wandb
+/test.ipynb

@@ -337,6 +337,8 @@ def train(
         bf16: bool = False,
         not_eol: bool = False,
         org_attn: bool = False,
+        *arg,
+        **kwarg
 ):
     # set NCCL_DEBUG
 

@@ -6,6 +6,6 @@ bitsandbytes==0.43.1
 scipy
 datasets==2.20.0
 safetensors==0.4.3
-pandas==1.1.5
+pandas
 scikit-learn
 prettytable
