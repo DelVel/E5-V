@@ -292,7 +292,7 @@ def ir(model, transform,
     assert img_embs.isnan().sum().item() == 0, 'nan in images emb'
 
     # get the score for each text and image pair
-    scores  = text_embs @ img_embs.t()
+    scores  = 1 - torch.cdist(text_embs, img_embs)
 
     positive_pairs = torch.zeros_like(scores, dtype=bool)
     positive_pairs[torch.arange(len(scores)), texts_image_index] = True
@@ -446,7 +446,7 @@ def cir(model, transform,
     assert retrieve_emb.isnan().sum().item() == 0, 'nan in retrieve emb'
     assert images_emb.isnan().sum().item() == 0, 'nan in images emb'
 
-    scores  = retrieve_emb @ images_emb.t()
+    scores  = 1 - torch.cdist(retrieve_emb, images_emb)
 
 
     labels = []

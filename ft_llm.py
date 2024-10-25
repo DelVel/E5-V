@@ -42,19 +42,41 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 
+def pdist(A, B, squared = False, eps = 1e-12):
+    D = A.pow(2).sum(1) + (-2) * B.mm(A.t())
+    D = (B.pow(2).sum(1) + D.t()).clamp(min=eps)
+    
+    if not squared:
+        D = D.sqrt()
+        
+    if torch.equal(A,B):
+        D = D.clone()
+        D[range(len(A)), range(len(A))] = 0
+        
+    return D
+
+
 def relaxed_contrastive_loss(t_emb, s_emb, sigma=1, delta=1):
+    s_emb = F.normalize(s_emb, p=2, dim=1)
+    
+    T_dist = pdist(t_emb, t_emb, False)
+    dist_mean = T_dist.mean(1, keepdim=True)
+    T_dist = T_dist / dist_mean
+        
     with torch.no_grad():
-        s_emb = F.normalize(s_emb, p=2, dim=1)
-        S_dist = torch.cdist(s_emb, s_emb)
+        S_dist = pdist(s_emb, s_emb, False)
         P = torch.exp(-S_dist.pow(2) / sigma)
+    
+    pos_weight = P
+    neg_weight = 1-P
+    
+    pull_losses = torch.relu(T_dist).pow(2) * pos_weight
+    push_losses = torch.relu(delta - T_dist).pow(2) * neg_weight
 
-    T_dist = torch.cdist(t_emb, t_emb)
-    T_dist = T_dist / T_dist.mean(1)
-
-    pull_losses = P * T_dist.pow(2)
-    push_losses = (1 - P) * (delta - T_dist).clamp(0).pow(2)
-
+    pull_losses = pull_losses[T_dist>0]
+    push_losses = push_losses[T_dist>0]
     loss = (pull_losses.sum() + push_losses.sum()) / len(t_emb)
+
     return loss
 
 class HackLlavaNextForConditionalGeneration(LlavaNextForConditionalGeneration):
