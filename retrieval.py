@@ -28,6 +28,7 @@ from datasets import load_from_disk, load_dataset
 
 from torch import nn
 import torch.nn.functional as F
+import torch.distributed as dist
 
 from transformers import AutoTokenizer
 from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
@@ -193,22 +194,17 @@ def init_model_and_transform(lora_path, bf16, fp32, use_e5v=False):
         model_name = "models/llava-llama-3-8b"
 
     if lora_path is not None:
-        merge_path = 'merged-' + lora_path.replace('/', '-').replace('.', '')
-        with accelerator.main_process_first():
-            if not os.path.exists(merge_path):
-                model = MODEL_CLASS.from_pretrained(model_name,
-                                                    device_map='cpu')
-                model.language_model = PeftModel.from_pretrained(model.language_model, lora_path).merge_and_unload()
-                model.save_pretrained(merge_path)
-        model_name = merge_path
+        rank = dist.get_rank()
+        with torch.cuda.device(rank):
+            model = MODEL_CLASS.from_pretrained(model_name,
+                                                torch_dtype=dtype, low_cpu_mem_usage=True, device_map=rank)
+            model.language_model = PeftModel.from_pretrained(model.language_model, lora_path, torch_device=f'cuda:{rank}').merge_and_unload()
 
     if use_e5v:
         model_name = 'royokong/e5-v'
         transform = LlavaNextProcessor.from_pretrained('royokong/e5-v')
 
 
-    model = MODEL_CLASS.from_pretrained(model_name,
-                                        torch_dtype=dtype, low_cpu_mem_usage=True)
     if MODEL_TYPE == 'llava_llama3':
         model.config.image_token_index = 128256
 
