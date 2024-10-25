@@ -10,7 +10,9 @@ from datasets import load_dataset,  load_from_disk
 import transformers
 from transformers import Trainer
 import torch.distributed as dist
-
+import webdataset as wds
+import torch.nn.functional as F
+from torchvision import transforms
 NIL_DATASET = True
 
 from transformers import LlamaTokenizer, LlamaConfig
@@ -33,7 +35,197 @@ from dataclasses import dataclass
 from transformers.utils import logging
 from transformers.trainer_callback import TrainerCallback
 logger = logging.get_logger(__name__)
+from typing import List, Optional
+from transformers.models.llava_next.modeling_llava_next import image_size_to_num_patches
+from transformers import LlavaNextForConditionalGeneration
+import torch
+import torch.utils.checkpoint
+from torch import nn
 
+def relaxed_contrastive_loss(t_emb, s_emb, sigma=1, delta=1):
+    with torch.no_grad():
+        s_emb = F.normalize(s_emb, p=2, dim=1)
+        S_dist = torch.cdist(s_emb, s_emb)
+        P = torch.exp(-S_dist.pow(2) / sigma)
+
+    T_dist = torch.cdist(t_emb, t_emb)
+    T_dist = T_dist / T_dist.mean(1)
+
+    pull_losses = P * T_dist.pow(2)
+    push_losses = (1 - P) * (delta - T_dist).clamp(0).pow(2)
+
+    loss = (pull_losses.sum() + push_losses.sum()) / len(t_emb)
+    return loss
+
+class HackLlavaNextForConditionalGeneration(LlavaNextForConditionalGeneration):
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        pixel_values: torch.FloatTensor = None,
+        image_sizes: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        vision_feature_layer: Optional[int] = None,
+        vision_feature_select_strategy: Optional[str] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ):
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        vision_feature_layer = (
+            vision_feature_layer if vision_feature_layer is not None else self.config.vision_feature_layer
+        )
+        vision_feature_select_strategy = (
+            vision_feature_select_strategy
+            if vision_feature_select_strategy is not None
+            else self.config.vision_feature_select_strategy
+        )
+
+        if inputs_embeds is None:
+            # 1. Extract the input embeddings
+            # In case image_token_index is not in the embeddings (extra token but embedding don't have it)
+            for_inputs_embeds_ids = input_ids.clone()
+            for_inputs_embeds_ids[(input_ids == self.config.image_token_index)] = 0
+            inputs_embeds = self.get_input_embeddings()(for_inputs_embeds_ids)
+
+            # 2. Merge text and images
+            if pixel_values is not None and input_ids.shape[1] != 1 and pixel_values.size(0) > 0:
+                # ! infer image_num_patches from image_sizes
+                image_num_patches = [
+                    image_size_to_num_patches(
+                        image_size=imsize,
+                        grid_pinpoints=self.config.image_grid_pinpoints,
+                        patch_size=self.config.vision_config.image_size,
+                    )
+                    for imsize in image_sizes
+                ]
+                # figure out if pixel_values is concatenated or stacked
+                if pixel_values.dim() == 5:
+                    # stacking when input is (batch_size, num_patches, num_channels, height, width)
+                    _pixel_values_list = [
+                        pix_val[:num_patch] for pix_val, num_patch in zip(pixel_values, image_num_patches)
+                    ]
+                    pixel_values = torch.cat(_pixel_values_list, dim=0)
+                elif pixel_values.dim() != 4:
+                    # otherwise has to be stacked from list of (num_patches, num_channels, height, width)
+                    raise ValueError(f"pixel_values of shape {pixel_values.shape}, expect to be of 4 or 5 dimensions")
+
+                image_features = self.vision_tower(pixel_values, output_hidden_states=True)
+                assert all(map(lambda x: x == image_num_patches[0], image_num_patches))
+                res_last_hidden_vision = image_features.pooler_output[::image_num_patches[0]]
+                selected_image_feature = image_features.hidden_states[vision_feature_layer]
+
+                if vision_feature_select_strategy == "default":
+                    selected_image_feature = selected_image_feature[:, 1:]
+                elif vision_feature_select_strategy == "full":
+                    selected_image_feature = selected_image_feature
+
+                image_features = self.multi_modal_projector(selected_image_feature)
+
+                image_features = torch.split(image_features, image_num_patches, dim=0)
+
+                # NOTE we only support multimodal_patch_merge_type == "spatial_unpad"
+
+                image_features, feature_lens = self.pack_image_features(
+                    image_features,
+                    image_sizes,
+                    image_newline=self.image_newline,
+                )
+
+                inputs_embeds = inputs_embeds.to(image_features.dtype)
+                inputs_embeds, attention_mask, position_ids, labels = self._merge_input_ids_with_image_features(
+                    image_features,
+                    feature_lens,
+                    inputs_embeds,
+                    input_ids,
+                    attention_mask,
+                    position_ids,
+                    labels=labels,
+                )
+
+            # pixel_values is not None but is empty ---> text only cases
+            elif pixel_values is not None and input_ids.shape[1] != 1 and pixel_values.size(0) == 0:
+                # there are no images
+                pass
+
+            # In case input_ids.shape[1] == 1 & pixel_values==None & past_key_values != None, we are in the case of
+            # generation with cache
+            elif past_key_values is not None and pixel_values is not None and input_ids.shape[1] == 1:
+                # Retrieve the first layer to inspect the logits and mask out the hidden states
+                # that are set to 0
+                first_layer_past_key_value = past_key_values[0][0][:, :, :, 0]
+
+                # Sum all dimensions of head_dim (-2) to avoid random errors such as: https://github.com/huggingface/transformers/pull/28032#issuecomment-1863691941
+                batch_index, non_attended_tokens = torch.where(first_layer_past_key_value.float().sum(-2) == 0)
+
+                # Get the target length
+                target_length = input_ids.shape[1]
+                past_length = first_layer_past_key_value.shape[-1]
+
+                extended_attention_mask = torch.ones(
+                    (attention_mask.shape[0], past_length),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                )
+
+                # Filter out only the tokens that can be un-attended, this can happen
+                # if one uses Llava + Fused modules where the cache on the
+                # first iteration is already big enough, or if one passes custom cache
+                valid_indices = non_attended_tokens < extended_attention_mask.size(-1)
+                new_batch_index = batch_index[valid_indices]
+                new_non_attended_tokens = non_attended_tokens[valid_indices]
+
+                # Zero-out the places where we don't need to attend
+                extended_attention_mask[new_batch_index, new_non_attended_tokens] = 0
+
+                attention_mask = torch.cat((extended_attention_mask, attention_mask[:, -target_length:]), dim=1)
+
+                position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
+
+        outputs = self.language_model(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        logits = outputs[0]
+
+        loss = None
+        if labels is not None:
+            # Shift so that tokens < n predict n
+            if attention_mask is not None:
+                shift_attention_mask = attention_mask[..., 1:]
+                shift_logits = logits[..., :-1, :][shift_attention_mask.to(logits.device) != 0].contiguous()
+                shift_labels = labels[..., 1:][shift_attention_mask.to(labels.device) != 0].contiguous()
+            else:
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1).to(shift_logits.device)
+            )
+
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
+
+        return res_last_hidden_vision, outputs.hidden_states
+    
 llama3_template = '''<|start_header_id|>user<|end_header_id|>
 
 {}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
@@ -170,6 +362,27 @@ class SentembTrainer(Trainer):
         return RandomSampler(self.train_dataset)
 
     def compute_loss(self, model, inputs, return_outputs=False):
+        clip_emb, hid_state = model(**inputs, output_hidden_states=True, return_dict=True)
+        hid_state = hid_state[-1][:, -1, :]
+
+        if dist.is_initialized():
+            z1_list = [torch.zeros_like(clip_emb) for _ in range(dist.get_world_size())]
+            z2_list = [torch.zeros_like(hid_state) for _ in range(dist.get_world_size())]
+            dist.all_gather(tensor_list=z1_list, tensor=clip_emb.contiguous())
+            dist.all_gather(tensor_list=z2_list, tensor=hid_state.contiguous())
+            z1_list[dist.get_rank()] = clip_emb
+            z2_list[dist.get_rank()] = hid_state
+            clip_emb = torch.cat(z1_list, 0)
+            hid_state = torch.cat(z2_list, 0)
+
+        clip_simmat = F.cosine_similarity(clip_emb.unsqueeze(1), clip_emb.unsqueeze(0), dim=-1)
+        hid_simmat = F.cosine_similarity(hid_state.unsqueeze(1), hid_state.unsqueeze(0), dim=-1)
+
+        bsize = clip_simmat.size(0)
+        loss = ((clip_simmat - hid_simmat) ** 2).sum() / bsize
+
+        return (loss, ) if return_outputs else loss
+
 
         if self.is_nli and self.use_neg_sentence:
             input_ids, labels, neg = inputs["input_ids"], inputs["labels"], inputs['attention_mask']
@@ -387,7 +600,6 @@ def train(
             base_llm_model = os.path.join('models', base_llm_model)
             base_llm_model = base_llm_model.strip('-')
             if not os.path.exists(base_llm_model):
-                from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
                 LlavaNextForConditionalGeneration.from_pretrained(
                     base_model,
                     device_map='cpu',
@@ -395,9 +607,8 @@ def train(
 
         if load_kbit == 4:
             assert load_kbit == 4
-            MODEL_CLS = AutoModelForCausalLM
-            model = MODEL_CLS.from_pretrained(
-                base_llm_model,
+            model = HackLlavaNextForConditionalGeneration.from_pretrained(
+                base_model,
                 quantization_config=BitsAndBytesConfig(
                     load_in_4bit=True,
                     bnb_4bit_compute_dtype=torch.bfloat16 if bf16 else torch.float16,
@@ -576,6 +787,8 @@ def train(
                     lora_module_names.remove('lm_head')
                 return list(lora_module_names)
             target_modules = find_all_linear_names(model)
+            target_modules = "|".join(end for end in target_modules)
+            target_modules = f"^language_model.*({target_modules})$"
             print(target_modules)
 
         config = LoraConfig(
@@ -610,7 +823,26 @@ def train(
 
     model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
 
-    train_data = data["train"].shuffle().map(generate_and_tokenize_prompt, num_proc=25)
+    from transformers import LlavaNextProcessor
+    transform = LlavaNextProcessor.from_pretrained("llava-hf/llava-v1.6-mistral-7b-hf")
+    tokenizer = AutoTokenizer.from_pretrained("unsloth/llama-3-8b-Instruct")
+    transform.tokenizer = tokenizer
+    transform.tokenizer.add_tokens('<image>')
+    transform.tokenizer.pad_token_id = transform.tokenizer.eos_token_id
+    transform.tokenizer.padding_side = "left"
+    transform.tokenizer.padding = True
+    model.config.image_token_index = 128256
+
+    def preprocess(x):
+        res = transform(['<|start_header_id|>user<|end_header_id|>\n\n<image>\nSummary above image in one word: <|efot_id|><|start_header_id|>assistant<|end_header_id|>\n\n \n'], x[0], return_tensors="pt", padding=True)
+        for reskey in res:
+            res[reskey] = res[reskey].squeeze_(0)
+        return res
+    
+    dpth = os.path.expanduser("~/dataset/cc3m/{00000..00331}.tar")
+    dlen = 200_000
+    train_data = wds.WebDataset(dpth, shardshuffle=True, detshuffle=True, seed=seed, nodesplitter=wds.shardlists.split_by_node).with_length(dlen).with_epoch(dlen).decode('pil').to_tuple("jpg").map(preprocess)
+
     DC_FUN = DataCollatorForSeq2SeqForNeg if NIL_DATASET and use_neg_sentence else transformers.DataCollatorForSeq2Seq
     data_collator = DC_FUN(
         tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
@@ -644,7 +876,7 @@ def train(
             deepspeed=deepspeed,
             gradient_checkpointing=grad_checkpoint,
         ),
-        data_collator=data_collator,
+        # data_collator=data_collator,
     )
     trainer.tokenizer = tokenizer
     trainer.is_nli = NIL_DATASET
