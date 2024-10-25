@@ -375,6 +375,9 @@ class SentembTrainer(Trainer):
             clip_emb = torch.cat(z1_list, 0)
             hid_state = torch.cat(z2_list, 0)
 
+        loss = relaxed_contrastive_loss(hid_state, clip_emb)
+        return (loss, ) if return_outputs else loss
+
         clip_simmat = F.cosine_similarity(clip_emb.unsqueeze(1), clip_emb.unsqueeze(0), dim=-1)
         hid_simmat = F.cosine_similarity(hid_state.unsqueeze(1), hid_state.unsqueeze(0), dim=-1)
 
