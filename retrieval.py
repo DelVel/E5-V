@@ -91,7 +91,7 @@ def emb_data(model, transform, dataset, device,
 
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=3*bsz if emb_type == 'text' else bsz,
-        shuffle=False, num_workers=1,
+        shuffle=False, num_workers=8,
         collate_fn=custom_collate_fn
     )
     dataloader = accelerator.prepare(dataloader)
@@ -117,7 +117,6 @@ def emb_data(model, transform, dataset, device,
 
         with torch.no_grad():
             emb = model(**inputs, output_hidden_states=True, return_dict=True).hidden_states[-1][:, -1, :]
-            emb = F.normalize(emb, dim=-1)
         emb = accelerator.gather(emb)
         embs.append(emb.cpu().float())
         bar.update(1)
@@ -198,7 +197,7 @@ def init_model_and_transform(lora_path, bf16, fp32, use_e5v=False):
         with torch.cuda.device(rank):
             model = MODEL_CLASS.from_pretrained(model_name,
                                                 torch_dtype=dtype, low_cpu_mem_usage=True, device_map=rank)
-            model.language_model = PeftModel.from_pretrained(model.language_model, lora_path, torch_device=f'cuda:{rank}').merge_and_unload()
+            model = PeftModel.from_pretrained(model, lora_path, torch_device=f'cuda:{rank}').merge_and_unload()
 
     if use_e5v:
         model_name = 'royokong/e5-v'
@@ -312,7 +311,7 @@ def ir(model, transform,
         metrics[f"image_retrieval_recall@{recall_k}"] = (batchify(recall_at_k, scores, positive_pairs, batch_size, device, k=recall_k)>0).float().mean().item()
         metrics[f"text_retrieval_recall@{recall_k}"] = (batchify(recall_at_k, scores.T, positive_pairs.T, batch_size, device, k=recall_k)>0).float().mean().item()
 
-    return metrics
+    return metrics, scores
 
 def cir(model, transform,
         img_prompt, text_img_prompt,
@@ -372,7 +371,7 @@ def cir(model, transform,
 
     img_dataloader = torch.utils.data.DataLoader(
         img_dataset, batch_size=bsz,
-        shuffle=False, num_workers=4,
+        shuffle=False, num_workers=8,
         collate_fn=collate_fn
     )
     img_dataloader = accelerator.prepare(img_dataloader)
@@ -387,7 +386,6 @@ def cir(model, transform,
                            batch['img'], return_tensors="pt", padding=True).to(device)
         with torch.no_grad():
             embs = model(**inputs, output_hidden_states=True, return_dict=True).hidden_states[-1][:, -1, :]
-            embs = F.normalize(embs, dim=-1)
             assert embs.isnan().sum() == 0, 'nan in emb after norm'
         embs = accelerator.gather(embs)
         images_embs.append(embs.cpu().float())
@@ -399,7 +397,7 @@ def cir(model, transform,
 
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=bsz,
-        shuffle=False, num_workers=4,
+        shuffle=False, num_workers=8,
         collate_fn=collate_fn
     )
 
@@ -427,7 +425,6 @@ def cir(model, transform,
                 embs = torch.cat(_embs, dim=0)
                 if fiq_two:
                     embs = embs[:len(batch['caption'])] + embs[len(batch['caption']):]
-                embs = F.normalize(embs, dim=-1)
         else:
             inputs = transform(input_texts,
                             images, return_tensors="pt", padding=True).to(device)
@@ -435,7 +432,6 @@ def cir(model, transform,
                 embs = model(**inputs, output_hidden_states=True, return_dict=True).hidden_states[-1][:, -1, :]
                 if fiq_two:
                     embs = embs[:len(batch['caption'])] + embs[len(batch['caption']):]
-                embs = F.normalize(embs, dim=-1)
         embs = accelerator.gather(embs)
         retrieve_emb.append(embs.cpu().float())
         bar.update(1)
@@ -495,7 +491,7 @@ def cir(model, transform,
         r_at_5 = cir_recall_at_k(scores, labels, 10)
         metrics = [r_at_1, r_at_3, r_at_5]
 
-    return metrics
+    return metrics, scores
 
 def main(
         llava: bool = False,
@@ -575,7 +571,7 @@ def main(
                 print(img_prompt)
                 print(text_prompt)
 
-            metrics = ir(model, transform, img_prompt, text_prompt,
+            metrics, matrix = ir(model, transform, img_prompt, text_prompt,
                          data, device, ocr_replace_text, batch_size)
         elif data == 'fashioniq' or data == 'cirr' or data == 'cirrtest':
             if data == 'fashioniq':
@@ -605,7 +601,7 @@ def main(
                 print(img_prompt)
                 print(text_img_prompt)
 
-            metrics = cir(model, transform, img_prompt, text_img_prompt, data, fiq_data_type,
+            metrics, matrix = cir(model, transform, img_prompt, text_img_prompt, data, fiq_data_type,
                           device,
                           fiq_two=fiq_two,
                           batch_size=batch_size)
@@ -613,7 +609,10 @@ def main(
         if accelerator.is_main_process:
             print(metrics)
             if lora_path is not None or name is not None:
-                checkpoint_name = lora_path.replace('/', '_') + '.txt' if lora_path is not None else name
+                dir_path = lora_path.replace('/', '_')
+                os.makedirs(dir_path, exist_ok=True)
+                torch.save(matrix, f"{dir_path}/{data}_{fiq_data_type}.pt")
+                checkpoint_name = dir_path + '.txt' if lora_path is not None else name
             elif use_e5v:
                 checkpoint_name = 'e5v.txt'
             else:
