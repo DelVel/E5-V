@@ -198,7 +198,7 @@ def init_model_and_transform(lora_path, bf16, fp32, use_e5v=False):
         with torch.cuda.device(rank):
             model = MODEL_CLASS.from_pretrained(model_name,
                                                 torch_dtype=dtype, low_cpu_mem_usage=True, device_map=rank)
-            model.language_model = PeftModel.from_pretrained(model.language_model, lora_path, torch_device=f'cuda:{rank}').merge_and_unload()
+            model = PeftModel.from_pretrained(model, lora_path, torch_device=f'cuda:{rank}').merge_and_unload()
 
     if use_e5v:
         model_name = 'royokong/e5-v'
@@ -583,10 +583,10 @@ def main(
                 if fiq_data_type == 'toptee':
                     fiq_data_name = 'shirt'
                 img_prompt = f"[INST] <image>\n Describe this {fiq_data_name} in one word based on its style: [/INST]"
-                text_img_prompt = f"[INST] <image> change the style of this {fiq_data_name} to <sent>\n Desribe this modified {fiq_data_name} in one word based on its style: [/INST]"
+                text_img_prompt = f"[INST] <image> change the style of this {fiq_data_name} to <sent>\n Describe this modified {fiq_data_name} in one word based on its style: [/INST]"
             else:
                 img_prompt = "[INST] <image>\n Describe this image in one word: [/INST]"
-                text_img_prompt = "[INST] <image>Modify this image with \"<sent>\", desribe modified image in one word: [/INST]"
+                text_img_prompt = "[INST] <image>Modify this image with \"<sent>\", describe modified image in one word: [/INST]"
 
             if llava_llama3:
                 img_prompt = img_prompt.replace('[INST] ', '').replace(' [/INST]', '')

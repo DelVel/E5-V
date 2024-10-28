@@ -379,6 +379,12 @@ class SentembTrainer(Trainer):
         hid_simmat = F.cosine_similarity(hid_state.unsqueeze(1), hid_state.unsqueeze(0), dim=-1)
 
         bsize = clip_simmat.size(0)
+        
+        # normalize clip_simmat to fit in [-1, 1]
+        clip_mat_max = clip_simmat.amax()
+        clip_mat_min = clip_simmat.amin()
+        clip_simmat = 2 * (clip_simmat - clip_mat_min) / (clip_mat_max - clip_mat_min) - 1
+
         loss = ((clip_simmat - hid_simmat) ** 2).sum() / bsize
 
         return (loss, ) if return_outputs else loss
