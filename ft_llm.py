@@ -840,24 +840,37 @@ def train(
     model.config.image_token_index = 128256
 
     def preprocess(x):
-        res = transform(['<|start_header_id|>user<|end_header_id|>\n\n<image>\nSummary above image in one word: <|efot_id|><|start_header_id|>assistant<|end_header_id|>\n\n \n'], x[0], return_tensors="pt", padding=True)
-        for reskey in res:
-            res[reskey] = res[reskey].squeeze_(0)
-        return res
-    
-    dpth = os.path.expanduser("~/dataset/cc3m/{00000..00331}.tar")
-    dlen = 200_000
-    train_data = wds.WebDataset(dpth, shardshuffle=True, detshuffle=True, seed=seed, nodesplitter=wds.shardlists.split_by_node).with_length(dlen).with_epoch(dlen).decode('pil').to_tuple("jpg").map(preprocess)
+        return {
+            "images": x[0],
+            "text": "<|start_header_id|>user<|end_header_id|>\n\n<image>\nSummary above image in one word: <|efot_id|><|start_header_id|>assistant<|end_header_id|>\n\n \n",
+        }
 
-    DC_FUN = DataCollatorForSeq2SeqForNeg if NIL_DATASET and use_neg_sentence else transformers.DataCollatorForSeq2Seq
-    data_collator = DC_FUN(
-        tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
-        #tokenizer, return_tensors="pt", padding=True
+    dlen = 200_000
+    train_data = (
+        wds.WebDataset(
+            os.path.expanduser("~/dataset/cc3m/{00000..00331}.tar"),
+            shardshuffle=True,
+            detshuffle=True,
+            seed=seed,
+            nodesplitter=wds.shardlists.split_by_node,
+        )
+        .with_length(dlen)
+        .with_epoch(dlen)
+        .decode("pil")
+        .to_tuple("jpg")
+        .map(preprocess)
     )
+
+    def data_collator(features):
+        return transform(
+            images=[f["images"] for f in features],
+            text=[f["text"] for f in features],
+        )
 
     trainer = SentembTrainer(
         model=model,
         train_dataset=train_data,
+        data_collator=data_collator,
         args=transformers.TrainingArguments(
             per_device_train_batch_size=micro_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
@@ -881,8 +894,8 @@ def train(
             report_to=None,
             deepspeed=deepspeed,
             gradient_checkpointing=grad_checkpoint,
+            label_names=["images", "text"],
         ),
-        # data_collator=data_collator,
     )
     trainer.tokenizer = tokenizer
     trainer.is_nli = NIL_DATASET

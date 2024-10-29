@@ -1,4 +1,4 @@
-RUN=e5v-8b
+RUN=e5v-8b-1
 
 args=()
 
@@ -9,9 +9,9 @@ BIT=4
 
 R=64
 ALPHA=16
-BATCH_SIZE=640
+BATCH_SIZE=40
 MICRO_BATCH_SIZE=20
-EPOCH=2
+EPOCH=1
 LR=4e-4
 
 echo $BASE_MODEL
