@@ -312,7 +312,7 @@ def ir(model, transform,
         metrics[f"image_retrieval_recall@{recall_k}"] = (batchify(recall_at_k, scores, positive_pairs, batch_size, device, k=recall_k)>0).float().mean().item()
         metrics[f"text_retrieval_recall@{recall_k}"] = (batchify(recall_at_k, scores.T, positive_pairs.T, batch_size, device, k=recall_k)>0).float().mean().item()
 
-    return metrics
+    return metrics, scores
 
 def cir(model, transform,
         img_prompt, text_img_prompt,
@@ -495,7 +495,7 @@ def cir(model, transform,
         r_at_5 = cir_recall_at_k(scores, labels, 10)
         metrics = [r_at_1, r_at_3, r_at_5]
 
-    return metrics
+    return metrics, scores
 
 def main(
         llava: bool = False,
@@ -575,7 +575,7 @@ def main(
                 print(img_prompt)
                 print(text_prompt)
 
-            metrics = ir(model, transform, img_prompt, text_prompt,
+            metrics, matrix = ir(model, transform, img_prompt, text_prompt,
                          data, device, ocr_replace_text, batch_size)
         elif data == 'fashioniq' or data == 'cirr' or data == 'cirrtest':
             if data == 'fashioniq':
@@ -605,7 +605,7 @@ def main(
                 print(img_prompt)
                 print(text_img_prompt)
 
-            metrics = cir(model, transform, img_prompt, text_img_prompt, data, fiq_data_type,
+            metrics, matrix = cir(model, transform, img_prompt, text_img_prompt, data, fiq_data_type,
                           device,
                           fiq_two=fiq_two,
                           batch_size=batch_size)
@@ -613,7 +613,10 @@ def main(
         if accelerator.is_main_process:
             print(metrics)
             if lora_path is not None or name is not None:
-                checkpoint_name = lora_path.replace('/', '_') + '.txt' if lora_path is not None else name
+                dir_path = lora_path.replace('/', '_')
+                os.makedirs(dir_path, exist_ok=True)
+                torch.save(matrix, f"{dir_path}/{data}_{fiq_data_type}.pt")
+                checkpoint_name = dir_path + '.txt' if lora_path is not None else name
             elif use_e5v:
                 checkpoint_name = 'e5v.txt'
             else:
