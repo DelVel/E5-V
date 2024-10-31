@@ -1,4 +1,4 @@
-RUN=e5v-8b-1
+RUN=e5v-8b-contra
 
 args=()
 
@@ -9,7 +9,7 @@ BIT=4
 
 R=64
 ALPHA=16
-BATCH_SIZE=40
+BATCH_SIZE=640
 MICRO_BATCH_SIZE=20
 EPOCH=1
 LR=4e-4

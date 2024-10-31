@@ -41,6 +41,123 @@ from transformers import LlavaNextForConditionalGeneration
 import torch
 import torch.utils.checkpoint
 from torch import nn
+from transformers import (
+    CLIPProcessor,
+    CLIPVisionModelWithProjection,
+)
+import numpy as np
+import faiss
+from torch.utils.data import IterableDataset
+
+
+class WrapperDataset(IterableDataset):
+    def __init__(self, ds):
+        self.ds = ds
+        self.model = CLIPVisionModelWithProjection.from_pretrained(
+            "openai/clip-vit-large-patch14"
+        ).cuda()
+        self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
+        self.index = faiss.IndexFlatIP(self.model.config.projection_dim)
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __iter__(self):
+        index_min_len = 1000
+        cur_label = 0
+        img_cache, res_cache = [], []
+        for imgs, ress in self._get_dset_map():
+            img_cache.extend(imgs)
+            res_cache.extend(ress)
+            self.index.add(np.stack(ress))
+            while len(img_cache) >= index_min_len:
+                datapoint = img_cache.pop(0)
+                dres = res_cache.pop(0)
+                self.index.remove_ids(torch.tensor([0]))
+                yield {
+                    "images": datapoint,
+                    "text": "<|start_header_id|>user<|end_header_id|>\n\n<image>\nSummary above image in one word: <|efot_id|><|start_header_id|>assistant<|end_header_id|>\n\n \n",
+                    "label": cur_label,
+                }
+                _, I = self.index.search(np.array([dres]), 1)
+
+                first_idx = I[0][0]
+                first_datapoint = img_cache.pop(first_idx)
+                res_cache.pop(first_idx)
+                self.index.remove_ids(torch.tensor([first_idx]))
+                yield {
+                    "images": first_datapoint,
+                    "text": "<|start_header_id|>user<|end_header_id|>\n\n<image>\nSummary above image in one word: <|efot_id|><|start_header_id|>assistant<|end_header_id|>\n\n \n",
+                    "label": cur_label,
+                }
+                cur_label += 1
+        if not img_cache:
+            return
+        while len(img_cache) >= 2:
+            datapoint = img_cache.pop(0)
+            dres = res_cache.pop(0)
+            self.index.remove_ids(torch.tensor([0]))
+            yield {
+                "images": datapoint,
+                "text": "<|start_header_id|>user<|end_header_id|>\n\n<image>\nSummary above image in one word: <|efot_id|><|start_header_id|>assistant<|end_header_id|>\n\n \n",
+                "label": cur_label,
+            }
+
+            _, I = self.index.search(np.array([dres]), 1)
+
+            first_idx = I[0][0]
+            first_datapoint = img_cache.pop(first_idx)
+            res_cache.pop(first_idx)
+            self.index.remove_ids(torch.tensor([first_idx]))
+            yield {
+                "images": first_datapoint,
+                "text": "<|start_header_id|>user<|end_header_id|>\n\n<image>\nSummary above image in one word: <|efot_id|><|start_header_id|>assistant<|end_header_id|>\n\n \n",
+                "label": cur_label,
+            }
+            cur_label += 1
+        for datapoint in img_cache:
+            yield {
+                "images": datapoint,
+                "text": "<|start_header_id|>user<|end_header_id|>\n\n<image>\nSummary above image in one word: <|efot_id|><|start_header_id|>assistant<|end_header_id|>\n\n \n",
+                "label": cur_label,
+            }
+
+    def _get_dset_map(self):
+        batching_size = 32
+        img_cache, res_cache = [], []
+        for item in self.ds:
+            img = item
+            img_cache.append(img)
+            if len(img_cache) != batching_size:
+                continue
+            inputs = self.processor(
+                images=img_cache,
+                return_tensors="pt",
+                padding=True,
+            ).to('cuda')
+            with torch.no_grad():
+                res = self.model(**inputs).image_embeds
+                res = torch.nn.functional.normalize(res, p=2, dim=-1)
+            res = res.cpu().numpy()
+            for res_row in res:
+                res_cache.append(res_row)
+            yield img_cache, res_cache
+            img_cache, res_cache = [], []
+        if not img_cache:
+            return
+        inputs = self.processor(
+            images=img_cache,
+            return_tensors="pt",
+            padding=True,
+        ).to('cuda')
+        with torch.no_grad():
+            res = self.model(**inputs).image_embeds
+            res = torch.nn.functional.normalize(res, p=2, dim=-1)
+        res = res.cpu().numpy()
+        for res_row in res:
+            res_cache.append(res_row)
+        yield img_cache, res_cache
+    
 
 def relaxed_contrastive_loss(t_emb, s_emb, sigma=1, delta=1):
     with torch.no_grad():
@@ -225,7 +342,7 @@ class HackLlavaNextForConditionalGeneration(LlavaNextForConditionalGeneration):
             return (loss,) + output if loss is not None else output
 
         return res_last_hidden_vision, outputs.hidden_states
-    
+
 llama3_template = '''<|start_header_id|>user<|end_header_id|>
 
 {}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
@@ -362,30 +479,28 @@ class SentembTrainer(Trainer):
         return RandomSampler(self.train_dataset)
 
     def compute_loss(self, model, inputs, return_outputs=False):
-        clip_emb, hid_state = model(**inputs, output_hidden_states=True, return_dict=True)
+        labels = inputs.pop("label")
+        _, hid_state = model(**inputs, output_hidden_states=True, return_dict=True)
         hid_state = hid_state[-1][:, -1, :]
 
+        b = hid_state.view(-1, 2, hid_state.size(-1))
+        lb = labels.view(-1, 2)
+        anc, pos = b[:, 0], b[:, 1]
+
         if dist.is_initialized():
-            z1_list = [torch.zeros_like(clip_emb) for _ in range(dist.get_world_size())]
-            z2_list = [torch.zeros_like(hid_state) for _ in range(dist.get_world_size())]
-            dist.all_gather(tensor_list=z1_list, tensor=clip_emb.contiguous())
-            dist.all_gather(tensor_list=z2_list, tensor=hid_state.contiguous())
-            z1_list[dist.get_rank()] = clip_emb
-            z2_list[dist.get_rank()] = hid_state
-            clip_emb = torch.cat(z1_list, 0)
-            hid_state = torch.cat(z2_list, 0)
+            z1_list = [torch.zeros_like(anc) for _ in range(dist.get_world_size())]
+            z2_list = [torch.zeros_like(pos) for _ in range(dist.get_world_size())]
+            dist.all_gather(tensor_list=z1_list, tensor=anc.contiguous())
+            dist.all_gather(tensor_list=z2_list, tensor=pos.contiguous())
+            z1_list[dist.get_rank()] = anc
+            z2_list[dist.get_rank()] = pos
+            anc = torch.cat(z1_list, 0)
+            pos = torch.cat(z2_list, 0)
 
-        clip_simmat = F.cosine_similarity(clip_emb.unsqueeze(1), clip_emb.unsqueeze(0), dim=-1)
-        hid_simmat = F.cosine_similarity(hid_state.unsqueeze(1), hid_state.unsqueeze(0), dim=-1)
-
-        bsize = clip_simmat.size(0)
-        
-        # normalize clip_simmat to fit in [-1, 1]
-        clip_mat_max = clip_simmat.amax()
-        clip_mat_min = clip_simmat.amin()
-        clip_simmat = 2 * (clip_simmat - clip_mat_min) / (clip_mat_max - clip_mat_min) - 1
-
-        loss = ((clip_simmat - hid_simmat) ** 2).sum() / bsize
+        simmat = F.cosine_similarity(anc.unsqueeze(1).float(), pos.unsqueeze(0).float(), dim=-1)
+        simmat = simmat / 0.05
+        labels = torch.arange(simmat.size(0)).long().to(simmat.device)
+        loss = F.cross_entropy(simmat, labels)
 
         return (loss, ) if return_outputs else loss
 
@@ -840,10 +955,7 @@ def train(
     model.config.image_token_index = 128256
 
     def preprocess(x):
-        return {
-            "images": x[0],
-            "text": "<|start_header_id|>user<|end_header_id|>\n\n<image>\nSummary above image in one word: <|efot_id|><|start_header_id|>assistant<|end_header_id|>\n\n \n",
-        }
+        return x[0]
 
     dlen = 200_000
     train_data = (
@@ -860,12 +972,16 @@ def train(
         .to_tuple("jpg")
         .map(preprocess)
     )
+    train_data = WrapperDataset(train_data)
 
     def data_collator(features):
-        return transform(
+        labels = torch.tensor([f["label"] for f in features], dtype=torch.long)
+        res = transform(
             images=[f["images"] for f in features],
             text=[f["text"] for f in features],
         )
+        res["label"] = labels
+        return res
 
     trainer = SentembTrainer(
         model=model,
@@ -894,7 +1010,7 @@ def train(
             report_to=None,
             deepspeed=deepspeed,
             gradient_checkpointing=grad_checkpoint,
-            label_names=["images", "text"],
+            label_names=["images", "text", "label"],
         ),
     )
     trainer.tokenizer = tokenizer
