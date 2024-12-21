@@ -1,43 +1,20 @@
-import csv
 import json
 import os
-import math
-import glob
-import random
-import sys
+
 import torch
-from contextlib import suppress
-from tqdm import tqdm
-
-import argparse
-from accelerate import Accelerator
-import transformers
-from copy import copy
-from itertools import product
-
-
-import logging
-
-from collections import defaultdict
-from html.parser import HTMLParser
-from typing import Any, Callable, Dict, List, Optional, Tuple
-
-from PIL import Image
-from datasets import load_from_disk, load_dataset
-
-
-from torch import nn
-import torch.nn.functional as F
 import torch.distributed as dist
-
-from transformers import AutoTokenizer
-from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
-from transformers import LlavaNextConfig, AutoModel
-from transformers.models.llava_next.modeling_llava_next import LlavaNextMultiModalProjector
-from transformers import AutoModelForCausalLM
-from transformers import AutoProcessor
-
+import torch.nn.functional as F
+from accelerate import Accelerator
+from datasets import load_dataset, load_from_disk
 from peft import PeftModel
+from tqdm import tqdm
+from transformers import (
+    AutoModelForCausalLM,
+    AutoProcessor,
+    AutoTokenizer,
+    LlavaNextForConditionalGeneration,
+    LlavaNextProcessor,
+)
 
 DEBUG = False
 MODEL_TYPE = 'llava'
