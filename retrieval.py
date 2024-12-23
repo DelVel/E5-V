@@ -16,6 +16,8 @@ from transformers import (
     LlavaNextProcessor,
 )
 
+from ft_llm import LlavaNextCustom
+
 DEBUG = False
 MODEL_TYPE = 'llava'
 
@@ -156,12 +158,7 @@ def init_model_and_transform(lora_path, bf16, fp32, use_e5v=False):
         return model, transform
     else:
         MODEL_CLASS = LlavaNextForConditionalGeneration
-        transform = LlavaNextProcessor.from_pretrained("llava-hf/llava-v1.6-mistral-7b-hf")
-        if MODEL_TYPE == 'llava_llama3':
-            tokenizer = AutoTokenizer.from_pretrained("unsloth/llama-3-8b-Instruct")
-            transform.tokenizer = tokenizer
-            transform.tokenizer.add_tokens('<image>')
-            transform.tokenizer.pad_token_id = transform.tokenizer.eos_token_id
+        transform = LlavaNextProcessor.from_pretrained("llava-hf/llama3-llava-next-8b-hf")
         transform.tokenizer.padding_side = "left"
         transform.tokenizer.padding = True
 
@@ -173,17 +170,14 @@ def init_model_and_transform(lora_path, bf16, fp32, use_e5v=False):
     if lora_path is not None:
         rank = dist.get_rank()
         with torch.cuda.device(rank):
-            model = MODEL_CLASS.from_pretrained(model_name,
+            model = LlavaNextCustom.from_pretrained("llava-hf/llama3-llava-next-8b-hf",
                                                 torch_dtype=dtype, low_cpu_mem_usage=True, device_map=rank)
-            model.language_model = PeftModel.from_pretrained(model.language_model, lora_path, torch_device=f'cuda:{rank}').merge_and_unload()
+            model = PeftModel.from_pretrained(model, lora_path, torch_device=f'cuda:{rank}').merge_and_unload()
 
     if use_e5v:
         model_name = 'royokong/e5-v'
         transform = LlavaNextProcessor.from_pretrained('royokong/e5-v')
 
-
-    if MODEL_TYPE == 'llava_llama3':
-        model.config.image_token_index = 128256
 
     return model, transform
 

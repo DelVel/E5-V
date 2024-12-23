@@ -18,6 +18,17 @@ from transformers import (
 )
 
 
+class LlavaNextCustom(LlavaNextForConditionalGeneration):
+    """
+    A custom model that allows inputs without pixel values.
+    """
+    def forward(self, *args, **kwargs):
+        pixel_values = kwargs.get("pixel_values", None)
+        if pixel_values is not None:
+            return super().forward(*args, **kwargs)
+        return self.language_model.forward(*args, **kwargs)
+
+
 class GatherLayer(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
@@ -140,7 +151,7 @@ def get_model(
     model_dtype,
     device,
 ):
-    model = LlavaNextForConditionalGeneration.from_pretrained(
+    model = LlavaNextCustom.from_pretrained(
         model_name,
         torch_dtype=model_dtype,
         device_map=device,
@@ -152,8 +163,7 @@ def get_model(
             bnb_4bit_use_double_quant=True,
             load_in_4bit=True,
         ),
-    ).language_model
-    model.config.use_cache = False
+    )
 
     if grad_checkpoint:
         model.enable_input_require_grads()
@@ -165,6 +175,7 @@ def get_model(
             r=lora_r,
             lora_alpha=lora_alpha,
             target_modules=lora_target_modules,
+            exclude_modules="^(?!language_model).*$",
             lora_dropout=lora_dropout,
             bias="none",
             task_type="CAUSAL_LM",
