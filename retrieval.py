@@ -1,154 +1,326 @@
-import json
-import os
+from dataclasses import dataclass
+from itertools import permutations
+from os import cpu_count
+from pathlib import Path
 
+import datasets
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import transformers
 from accelerate import Accelerator
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset
+from einops import rearrange, reduce
+from fire import Fire
 from peft import PeftModel
+from torch.distributed.elastic.multiprocessing import errors
+from torch.utils import data
 from tqdm import tqdm
-from transformers import (
-    AutoModelForCausalLM,
-    AutoProcessor,
-    AutoTokenizer,
-    LlavaNextForConditionalGeneration,
-    LlavaNextProcessor,
-)
+from transformers import LlavaNextProcessor
 
 from ft_llm import LlavaNextCustom
-from datasets import disable_caching
-from fire import Fire
 
 accelerator = Accelerator()
 
-llama3_template = "<|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n \n"
+
+@dataclass
+class Lazy:
+    def __init__(self, func):
+        self.func = func
+        self.result = None
+
+    def __call__(self):
+        if self.result is None:
+            self.result = self.func()
+            self.func = None
+        return self.result
 
 
-def recall_at_k(scores, positive_pairs, k):
-    """
-    Compute the recall at k for each sample
-    :param scores: compability score between  text and image embeddings (nb texts, nb images)
-    :param k: number of images to consider per text, for retrieval
-    :param positive_pairs: boolean matrix of positive pairs (nb texts, nb images)
-    :return: recall at k averaged over all texts
-    """
-    nb_texts, nb_images = scores.shape
-    # for each text, sort according to image scores in decreasing order
-    topk_indices = torch.topk(scores, k, dim=1)[1]
-    # compute number of positives for each text
-    nb_positive = positive_pairs.sum(dim=1)
-    # nb_texts, k, nb_images
-    topk_indices_onehot = torch.nn.functional.one_hot(
-        topk_indices, num_classes=nb_images
+@dataclass
+class Modality:
+    name: str
+    dataset_name: str
+    dataset: callable
+
+    def __post_init__(self):
+        self.dataset = Lazy(self.dataset)
+
+    def on_embed_done(self, embs, indices):
+        return embs, indices
+
+
+class FIQQueryModality(Modality):
+    def on_embed_done(self, embs, indices):
+        embs = reduce(embs, "(b 2) d -> b d", "sum")
+        indices = rearrange(indices, "(b e) -> e b", e=2)[0]
+        return embs, indices
+
+
+@dataclass
+class Retrieval:
+    ks: list[int]
+    src_modality: Modality
+    tgt_modality: Modality
+
+
+def ir_text_map(x, ind, transform):
+    text = [
+        prompt_text(f"{y}\nSummary above sentence in one word:")
+        for q in x["text"]
+        for y in q
+    ]
+    return {
+        **batch_apply_chat_template(transform, text),
+        "index": [f"{i}" for i, q in zip(ind, x["text"]) for _ in q],
+    }
+
+
+def ir_image_map(x, ind, transform):
+    text = [prompt_image_text("Summary above image in one word:") for _ in ind]
+    return {
+        **batch_apply_chat_template(transform, text),
+        "index": [f"{y}" for y in ind],
+    }
+
+
+def fiq_dataset_map(x, ind, transform, style):
+    tid = x["index"]
+    img = x["images"]
+    cap = x["text"]
+
+    res_idx = []
+    res_txt = []
+    res_img = []
+    for t, i, c in zip(tid, img, cap):
+        for c_perm in permutations(c):
+            res_idx.append(t)
+            res_img.append(i)
+            caption = ", ".join(cc.strip(".?, ") for cc in c_perm)
+            caption = prompt_image_text(
+                f"Change the style of this {style} to {caption}\nDescribe this modified {style} in one word based on its style:"
+            )
+            res_txt.append(caption)
+    res_txt = transform.apply_chat_template(res_txt, add_generation_prompt=True)
+    return {"index": res_idx, "images": res_img, "text": res_txt}
+
+
+def cirr_text_map(x, ind, transform):
+    text = [
+        prompt_image_text(
+            f'Modify this image with "{y}", describe modified image in one word:'
+        )
+        for y in x["text"]
+    ]
+    return batch_apply_chat_template(transform, text)
+
+
+def fiq_image_map(x, ind, transform, style):
+    text = [
+        prompt_image_text(f"Describe this {style} in one word based on its style:")
+        for _ in ind
+    ]
+    return batch_apply_chat_template(transform, text)
+
+
+def cirr_image_map(x, ind, transform):
+    text = [prompt_image_text("Describe this image in one word:") for _ in ind]
+    return batch_apply_chat_template(transform, text)
+
+
+def batch_apply_chat_template(transform, text):
+    return {
+        "text": transform.apply_chat_template(
+            text,
+            add_generation_prompt=True,
+        ),
+    }
+
+
+def get_flickr_text_dataset(transform):
+    return (
+        load_dataset("royokong/flickr30k_test", split="test")
+        .remove_columns("image")
+        .map(
+            lambda x, ind: ir_text_map(x, ind, transform),
+            batched=True,
+            with_indices=True,
+        )
     )
-    # compute number of true positives
-    positive_pairs_reshaped = positive_pairs.view(nb_texts, 1, nb_images)
-    # a true positive means a positive among the topk
-    nb_true_positive = (topk_indices_onehot * positive_pairs_reshaped).sum(dim=(1, 2))
-    # compute recall at k
-    return nb_true_positive / nb_positive
 
 
-def batchify(batch_size, device, func, X, Y, *args, **kwargs):
-    results = []
-    for start in range(0, len(X), batch_size):
-        end = start + batch_size
-        x = X[start:end].to(device)
-        y = Y[start:end].to(device)
-        result = func(x, y, *args, **kwargs).cpu()
-        results.append(result)
-    return torch.cat(results)
+def get_flickr_image_dataset(transform):
+    return (
+        load_dataset("royokong/flickr30k_test", split="test")
+        .rename_column("image", "images")
+        .map(
+            lambda x, ind: ir_image_map(x, ind, transform),
+            batched=True,
+            with_indices=True,
+        )
+    )
 
 
-def emb_data(
-    model,
-    transform,
-    dataset,
-    device,
-    emb_type="text",
-    prompt=None,
-    bsz=4,
-    text_column="caption",
-    img_column="img",
-):
-    # emb img
-    def custom_collate_fn(batch):
-        collated_batch = {}
-        for key in batch[0].keys():
-            collated_batch[key] = [b[key] for b in batch]
-        return collated_batch
+def get_coco_text_dataset(transform):
+    return (
+        load_dataset("royokong/coco_test", split="test")
+        .remove_columns("image")
+        .map(
+            lambda x, ind: ir_text_map(x, ind, transform),
+            batched=True,
+            with_indices=True,
+        )
+    )
 
-    dataloader = torch.utils.data.DataLoader(
+
+def get_coco_image_dataset(transform):
+    return (
+        load_dataset("royokong/coco_test", split="test")
+        .rename_column("image", "images")
+        .map(
+            lambda x, ind: ir_image_map(x, ind, transform),
+            batched=True,
+            with_indices=True,
+        )
+    )
+
+
+def get_fiq_text_dataset(transform, style):
+    return (
+        load_dataset("royokong/fashioniq_val", split="val")
+        .filter(lambda x: map(lambda y: y == style, x["category"]), batched=True)
+        .remove_columns(["candidate_id", "category", "split", "target"])
+        .rename_columns(
+            {"candidate": "images", "caption": "text", "target_id": "index"}
+        )
+        .map(
+            lambda x, ind: fiq_dataset_map(x, ind, transform, style),
+            batched=True,
+            with_indices=True,
+        )
+    )
+
+
+def get_fiq_image_dataset(transform, style):
+    return (
+        load_dataset("royokong/fashioniq_val_imgs", split="val")
+        .filter(lambda x: map(lambda y: y == style, x["category"]), batched=True)
+        .remove_columns(["category", "split"])
+        .rename_columns({"id": "index", "img": "images"})
+        .map(
+            lambda x, ind: fiq_image_map(x, ind, transform, style),
+            batched=True,
+            with_indices=True,
+        )
+    )
+
+
+def get_cirr_text_dataset(transform):
+    return (
+        load_dataset("royokong/cirr_val", split="val")
+        .remove_columns(["candidate_id", "group", "split", "target"])
+        .rename_columns(
+            {"target_id": "index", "candidate": "images", "caption": "text"}
+        )
+        .map(
+            lambda x, ind: cirr_text_map(x, ind, transform),
+            batched=True,
+            with_indices=True,
+        )
+    )
+
+
+def get_cirr_image_dataset(transform):
+    return (
+        load_dataset("royokong/cirr_imgs", split="val")
+        .remove_columns(["category", "split"])
+        .rename_columns({"id": "index", "img": "images"})
+        .map(
+            lambda x, ind: cirr_image_map(x, ind, transform),
+            batched=True,
+            with_indices=True,
+        )
+    )
+
+
+def recall_at_k(scores, positive_pairs, k, transpose=False):
+    dim = 0 if transpose else 1
+    topk_indices = scores.topk(k, dim=dim).indices
+    nb_true_positive = positive_pairs.sum(dim=dim)
+    nb_retrieved_positive = positive_pairs.gather(dim, topk_indices).sum(dim=dim)
+    recall = nb_retrieved_positive / nb_true_positive
+    recall = (recall > 0).float()
+    return recall
+
+
+def prompt_text(text):
+    cont = [
+        {"type": "text", "text": text},
+    ]
+    return prompt_user(cont)
+
+
+def prompt_image_text(text):
+    cont = [
+        {"type": "image"},
+        {"type": "text", "text": text},
+    ]
+    return prompt_user(cont)
+
+
+def prompt_user(cont):
+    msg = {"role": "user", "content": cont}
+    return [msg]
+
+
+def custom_collate_fn(batch, transform):
+    coll = {}
+    for key in batch[0]:
+        coll[key] = [x[key] for x in batch]
+    indices = coll.pop("index")
+    return transform(**coll, return_tensors="pt", padding=True), np.array(indices)
+
+
+def get_dataloader(dataset, transform):
+    dataloader = data.DataLoader(
         dataset,
-        batch_size=3 * bsz if emb_type == "text" else bsz,
+        batch_size=2,
         shuffle=False,
-        num_workers=1,
-        collate_fn=custom_collate_fn,
+        num_workers=cpu_count() // accelerator.num_processes,
+        collate_fn=lambda x: custom_collate_fn(x, transform),
+        pin_memory=True,
+        pin_memory_device=accelerator.device,
     )
-    dataloader = accelerator.prepare(dataloader)
+    return accelerator.prepare(dataloader)
+
+
+def map_to_embed(model, dataloader):
+    model = model()
     embs = []
-    bar = tqdm(total=len(dataloader))
+    indices = []
+    if accelerator.is_main_process:
+        dataloader = tqdm(dataloader)
     for batch in dataloader:
-        if emb_type == "text":
-            input_texts = [
-                prompt.replace("<sent>", text)
-                for text in sum(batch[text_column], start=[])
-            ]
-            inputs = transform(input_texts, return_tensors="pt", padding=True)
-            for key in inputs:
-                if inputs[key] is not None:
-                    inputs[key] = inputs[key].to(device)
-        else:
-            input_texts = [prompt] * len(batch[img_column])
-            inputs = transform(
-                input_texts, batch[img_column], return_tensors="pt", padding=True
-            ).to(device)
-
-        with torch.no_grad():
+        data, index = batch
+        with torch.inference_mode():
             emb = model(
-                **inputs, output_hidden_states=True, return_dict=True
+                **data, output_hidden_states=True, return_dict=True
             ).hidden_states[-1][:, -1, :]
-            emb = F.normalize(emb, dim=-1)
-        emb = accelerator.gather(emb)
-        embs.append(emb.cpu().float())
-        bar.update(1)
-    embs = torch.cat(embs)
-    total = 0
-    for i in dataset:
-        if emb_type == "text" and type(i[text_column]) is list:
-            total += len(i[text_column])
-        else:
-            total += 1
-    bar.close()
-    return embs[:total]
+        emb = accelerator.gather_for_metrics(emb)
+        embs.extend(emb)
+        index = accelerator.gather_for_metrics(index)
+        indices.extend(index)
+    return torch.stack(embs), np.stack(indices)
 
 
-def log_to_file(data, metrics, checkpoint_name, fiq_data_type=None):
-    if data == "flickr30k" or data == "coco":
-        output = f"{data}: {metrics['image_retrieval_recall@5']:.4f} {metrics['text_retrieval_recall@5']:.4f}"
-    elif data == "fashioniq":
-        assert len(metrics) == 2
-        r_at_1, r_at_5 = metrics
-        output = f"{data} {fiq_data_type}: R@10: {r_at_1:.4f} R@50: {r_at_5:.4f}"
-    elif data == "cirr":
-        assert len(metrics) == 3
-        r_at_1, r_at_3, r_at_5 = metrics
-        output = f"{data}:  R@1: {r_at_1:.4f} R@5: {r_at_3:.4f} R@10: {r_at_5:.4f}"
-    else:
-        raise ValueError(f"Unknown dataset {data}")
-
-    if checkpoint_name is not None:
-        with open(checkpoint_name, "a") as f:
-            print(output, file=f)
-    return output
-
-
-def init_model_and_transform(lora_path):
+def init_transform():
     transform = LlavaNextProcessor.from_pretrained("llava-hf/llama3-llava-next-8b-hf")
     transform.tokenizer.padding_side = "left"
     transform.tokenizer.padding = True
+    return transform
 
+
+def init_model(lora_path):
     rank = dist.get_rank()
     with torch.cuda.device(rank):
         model = LlavaNextCustom.from_pretrained(
@@ -161,316 +333,226 @@ def init_model_and_transform(lora_path):
             model = PeftModel.from_pretrained(
                 model, lora_path, torch_device=f"cuda:{rank}"
             ).merge_and_unload()
+    model = model.eval()
+    model = accelerator.prepare(model)
+    return model
 
-    return model, transform
 
-
-def ir(model, transform, data, batch_size=None):
-    img_prompt = llama3_template.format("<image>\nSummary above image in one word: ")
-    text_prompt = llama3_template.format("<sent>\nSummary above sentence in one word: ")
-    device = accelerator.device
-    dataset = load_dataset(f"royokong/{data}_test", split="test")
-
-    dataset = dataset.rename_column("text", "caption")
-    dataset = dataset.rename_column("image", "img")
-    if data == "coco":
-        dataset = dataset.map(lambda x: {"caption": x["caption"][:5]}, num_proc=4)
-
-    bsz = 4
-    if batch_size is not None:
-        bsz = batch_size
-
-    text_embs = emb_data(
-        model, transform, dataset, device, emb_type="text", prompt=text_prompt, bsz=bsz
-    )
-    img_embs = emb_data(
-        model, transform, dataset, device, emb_type="image", prompt=img_prompt, bsz=bsz
-    )
-
-    texts_image_index = [i // 5 for i in range(img_embs.shape[0] * 5)]
-    assert len(texts_image_index) == len(text_embs)
-
-    assert text_embs.isnan().sum().item() == 0, "nan in retrieve emb"
-    assert img_embs.isnan().sum().item() == 0, "nan in images emb"
-
-    # get the score for each text and image pair
+def calculate_score(text_embs, img_embs):
+    text_embs = F.normalize(text_embs, dim=-1)
+    img_embs = F.normalize(img_embs, dim=-1)
     scores = text_embs @ img_embs.t()
-
-    positive_pairs = torch.zeros_like(scores, dtype=bool)
-    positive_pairs[torch.arange(len(scores)), texts_image_index] = True
-    metrics = {}
-    recall_k_list = [1, 5, 10]
-    batch_size = 64
-    for recall_k in recall_k_list:
-        # Recall@k in this implementation computes the **actual** recall (nb_true_positives/nb_positives).
-        # For text retrieval, nb_positives represents all texts matching an image, often >1 due to multiple captions per image.
-        # In contrast, CLIP-like papers define recall@k as binary: 1 if at least one match is found among the top-k, otherwise 0.
-        # This can be derived from actual recall by checking if recall > 0.
-        # Dataset-level recall is the average of per-instance recalls.
-        metrics[f"image_retrieval_recall@{recall_k}"] = (
-            (
-                batchify(
-                    batch_size, device, recall_at_k, scores, positive_pairs, k=recall_k
-                )
-                > 0
-            )
-            .float()
-            .mean()
-            .item()
-        )
-        metrics[f"text_retrieval_recall@{recall_k}"] = (
-            (
-                batchify(
-                    batch_size,
-                    device,
-                    recall_at_k,
-                    scores.T,
-                    positive_pairs.T,
-                    k=recall_k,
-                )
-                > 0
-            )
-            .float()
-            .mean()
-            .item()
-        )
-
-    return metrics
+    return scores
 
 
-def cir(
-    model,
-    transform,
-    img_prompt,
-    text_img_prompt,
-    data,
-    fiq_data_type,
-    device,
-    fiq_two=False,
-    batch_size=None,
-):
-    if data == "fashioniq":
-        assert fiq_data_type in ["dress", "shirt", "toptee"]
-        dataset = load_dataset("royokong/fashioniq_val")
-        img_dataset = load_dataset("royokong/fashioniq_val_imgs")
-
-        dataset = dataset["val"].filter(
-            lambda x: x["category"] == fiq_data_type, num_proc=4
-        )
-        img_dataset = img_dataset["val"].filter(
-            lambda x: x["category"] == fiq_data_type, num_proc=4
-        )
-    else:
-        dataset = load_dataset("royokong/cirr_val")
-        img_dataset = load_dataset("royokong/cirr_imgs")
-
-        dataset = dataset["val"]
-        img_dataset = img_dataset["val"]
-
-    assert len(set(dataset["target_id"]) - set(img_dataset["id"])) == 0
-
-    bsz = 4
-    if fiq_two:
-        bsz //= 2
-    if batch_size is not None:
-        bsz = batch_size
-
-    # emb img
-    def custom_collate_fn(batch):
-        collated_batch = {}
-        for key in batch[0].keys():
-            collated_batch[key] = [b[key] for b in batch]
-        return collated_batch
-
-    collate_fn = custom_collate_fn
-
-    img_dataloader = torch.utils.data.DataLoader(
-        img_dataset, batch_size=bsz, shuffle=False, num_workers=4, collate_fn=collate_fn
+def calculate_pos_pairs(text_idx, img_idx):
+    positive_pairs = torch.from_numpy(text_idx[:, None] == img_idx[None, :]).to(
+        accelerator.device, non_blocking=True
     )
-    img_dataloader = accelerator.prepare(img_dataloader)
-    images_embs = []
-    bar = tqdm(total=len(img_dataloader))
-    for batch in img_dataloader:
-        input_texts = [img_prompt] * len(batch["img"])
-        inputs = transform(
-            input_texts, batch["img"], return_tensors="pt", padding=True
-        ).to(device)
-        with torch.no_grad():
-            embs = model(
-                **inputs, output_hidden_states=True, return_dict=True
-            ).hidden_states[-1][:, -1, :]
-            embs = F.normalize(embs, dim=-1)
-            assert embs.isnan().sum() == 0, "nan in emb after norm"
-        embs = accelerator.gather(embs)
-        images_embs.append(embs.cpu().float())
-        bar.update(1)
-    images_emb = torch.cat(images_embs)[: len(img_dataset["id"])]
-    images_ids = img_dataset["id"]
+    return positive_pairs
 
-    bar.close()
 
-    dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=bsz, shuffle=False, num_workers=4, collate_fn=collate_fn
-    )
+def tee(metric_file_path, to_print):
+    with open(metric_file_path, "a") as f:
+        f.write(to_print)
+    print(to_print, end="")
 
-    retrieve_emb = []
-    dataloader = accelerator.prepare(dataloader)
-    bar = tqdm(total=len(dataloader))
-    for batch in dataloader:
-        images = batch["candidate"]
-        if data == "fashioniq":
-            caption = batch["caption"]
-            if fiq_two:
-                caption = caption + [i[::-1] for i in caption]
-                images = images + images
-            input_texts = [
-                text_img_prompt.replace(
-                    "<sent>", ", ".join([cc.strip(".?, ") for cc in c])
-                )
-                for c in caption
-            ]
-        else:
-            input_texts = [
-                text_img_prompt.replace("<sent>", c) for c in batch["caption"]
-            ]
 
-        inputs = transform(input_texts, images, return_tensors="pt", padding=True).to(
-            device
+def modality_to_embed(transform, model, modality: Modality, lora_path):
+    path_ = Path(lora_path)
+    emb_path = path_ / f"{modality.dataset_name},{modality.name}.pt"
+    idx_path = path_ / f"{modality.dataset_name},{modality.name}.npy"
+    if emb_path.exists() and idx_path.exists():
+        embs = torch.load(
+            str(emb_path), map_location=accelerator.device, weights_only=True
         )
-        with torch.no_grad():
-            embs = model(
-                **inputs, output_hidden_states=True, return_dict=True
-            ).hidden_states[-1][:, -1, :]
-            if fiq_two:
-                embs = embs[: len(batch["caption"])] + embs[len(batch["caption"]) :]
-            embs = F.normalize(embs, dim=-1)
-        embs = accelerator.gather(embs)
-        retrieve_emb.append(embs.cpu().float())
-        bar.update(1)
-    retrieve_emb = torch.cat(retrieve_emb)[: len(dataset["target_id"])]
-    target_ids = dataset["target_id"]
-    bar.close()
-
-    assert retrieve_emb.isnan().sum().item() == 0, "nan in retrieve emb"
-    assert images_emb.isnan().sum().item() == 0, "nan in images emb"
-
-    scores = retrieve_emb @ images_emb.t()
-
-    labels = []
-    for i, target_id in enumerate(target_ids):
-        labels.append(images_ids.index(target_id))
-
-    if data == "cirr":
-        # remove reference itself like SEARLE
-        mask_index = [images_ids.index(label) for label in dataset["candidate_id"]]
-        for i, mid in enumerate(mask_index):
-            scores[i][mid] = -1
-
-    def cir_recall_at_k(scores, labels, k):
-        """
-        Calculate Recall@k using PyTorch
-        """
-        num_queries = scores.size(0)
-        recalls = []
-        for i in range(num_queries):
-            top_k_indices = torch.topk(scores[i], k=k, largest=True).indices
-            recalls.append(int(labels[i] in top_k_indices))
-        return sum(recalls) / num_queries
-
-    if data == "fashioniq":
-        # Calculate R@1, R@3, and R@5
-        r_at_1 = cir_recall_at_k(scores, labels, 10)
-        r_at_5 = cir_recall_at_k(scores, labels, 50)
-        metrics = [r_at_1, r_at_5]
-    else:
-        # Calculate R@1, R@3, and R@5
-        r_at_1 = cir_recall_at_k(scores, labels, 1)
-        r_at_3 = cir_recall_at_k(scores, labels, 5)
-        r_at_5 = cir_recall_at_k(scores, labels, 10)
-        metrics = [r_at_1, r_at_3, r_at_5]
-
-    return metrics
-
-
-def main(
-    lora_path: str = None,
-    batch_size: int = 2,
-):
-    if os.environ.get("NCCL_DEBUG", None) is None:
-        os.environ["NCCL_DEBUG"] = "ERROR"
-
-    device = accelerator.device
-
-    model, transform = init_model_and_transform(lora_path)
-    model.to(device)
-
-    disable_caching()
-
-    datasets = [
-        "flickr30k",
-        "coco",
-        "fashioniq dress",
-        "fashioniq shirt",
-        "fashioniq toptee",
-        "cirr",
-    ]
-
-    all_results = []
-    for data in datasets:
-        if "fashioniq" in data:
-            data, fiq_data_type = data.split(" ")
-            fiq_two = True
-        else:
-            fiq_data_type = None
-            fiq_two = False
-
-        if data == "flickr30k" or data == "coco":
-            metrics = ir(model, transform, data, batch_size)
-        elif data == "fashioniq" or data == "cirr":
-            metrics = cir_2(batch_size, data, fiq_data_type, fiq_two, model, transform)
-        else:
-            raise ValueError(f"Unknown dataset {data}")
-
+        idx = np.load(str(idx_path))
         if accelerator.is_main_process:
-            print(metrics)
-            if lora_path is not None:
-                checkpoint_name = lora_path.replace("/", "_") + ".txt"
-            else:
-                checkpoint_name = None
-            all_results.append(
-                log_to_file(data, metrics, checkpoint_name, fiq_data_type=fiq_data_type)
-            )
+            print(f"Loaded `{modality.dataset_name}::{modality.name}` from cache.")
+        return embs, idx
 
     if accelerator.is_main_process:
-        print("\n".join(all_results))
+        print(f"Embedding `{modality.dataset_name}::{modality.name}`.")
+    mod1 = modality.dataset()
+    mod1_dataloader = get_dataloader(mod1, transform)
+    mod1_embs, mod1_idx = map_to_embed(model, mod1_dataloader)
+    mod1_embs, mod1_idx = modality.on_embed_done(mod1_embs, mod1_idx)
+    if accelerator.is_main_process:
+        torch.save(mod1_embs, str(emb_path))
+        np.save(str(idx_path), mod1_idx)
+    return mod1_embs, mod1_idx
 
 
-def cir_2(batch_size, data, fiq_data_type, fiq_two, model, transform):
-    if data == "fashioniq":
-        fiq_data_name = fiq_data_type
-        if fiq_data_type == "toptee":
-            fiq_data_name = "shirt"
-        img_prompt = (
-            f"<image>\n Describe this {fiq_data_name} in one word based on its style:"
-        )
-        text_img_prompt = f"<image> change the style of this {fiq_data_name} to <sent>\n Describe this modified {fiq_data_name} in one word based on its style:"
-    else:
-        img_prompt = "<image>\n Describe this image in one word:"
-        text_img_prompt = '<image>Modify this image with "<sent>", describe modified image in one word:'
-    img_prompt = llama3_template.format(img_prompt)
-    text_img_prompt = llama3_template.format(text_img_prompt)
+@errors.record
+def main(lora_path: str = None):
+    if not accelerator.is_main_process:
+        transformers.utils.logging.disable_progress_bar()
+        datasets.disable_progress_bars()
 
-    return cir(
-        model,
-        transform,
-        img_prompt,
-        text_img_prompt,
-        data,
-        fiq_data_type,
-        accelerator.device,
-        fiq_two=fiq_two,
-        batch_size=batch_size,
+    transform = init_transform()
+
+    flickr_text_modality = Modality(
+        name="text",
+        dataset_name="flickr",
+        dataset=lambda: get_flickr_text_dataset(transform),
     )
+
+    flickr_image_modality = Modality(
+        name="image",
+        dataset_name="flickr",
+        dataset=lambda: get_flickr_image_dataset(transform),
+    )
+
+    coco_text_modality = Modality(
+        name="text",
+        dataset_name="coco",
+        dataset=lambda: get_coco_text_dataset(transform),
+    )
+
+    coco_image_modality = Modality(
+        name="image",
+        dataset_name="coco",
+        dataset=lambda: get_coco_image_dataset(transform),
+    )
+
+    fiq_dress_query_modality = FIQQueryModality(
+        name="query",
+        dataset_name="fiq_dress",
+        dataset=lambda: get_fiq_text_dataset(transform, "dress"),
+    )
+
+    fiq_dress_image_modality = Modality(
+        name="image",
+        dataset_name="fiq_dress",
+        dataset=lambda: get_fiq_image_dataset(transform, "dress"),
+    )
+
+    fiq_shirt_query_modality = FIQQueryModality(
+        name="query",
+        dataset_name="fiq_shirt",
+        dataset=lambda: get_fiq_text_dataset(transform, "shirt"),
+    )
+
+    fiq_shirt_image_modality = Modality(
+        name="image",
+        dataset_name="fiq_shirt",
+        dataset=lambda: get_fiq_image_dataset(transform, "shirt"),
+    )
+
+    fiq_toptee_query_modality = FIQQueryModality(
+        name="query",
+        dataset_name="fiq_toptee",
+        dataset=lambda: get_fiq_text_dataset(transform, "toptee"),
+    )
+
+    fiq_toptee_image_modality = Modality(
+        name="image",
+        dataset_name="fiq_toptee",
+        dataset=lambda: get_fiq_image_dataset(transform, "toptee"),
+    )
+
+    cirr_text_modality = Modality(
+        name="query",
+        dataset_name="cirr",
+        dataset=lambda: get_cirr_text_dataset(transform),
+    )
+
+    cirr_image_modality = Modality(
+        name="image",
+        dataset_name="cirr",
+        dataset=lambda: get_cirr_image_dataset(transform),
+    )
+
+    flickr_t2i_retrieval = Retrieval(
+        ks=[1, 5, 10],
+        src_modality=flickr_text_modality,
+        tgt_modality=flickr_image_modality,
+    )
+
+    flickr_i2t_retrieval = Retrieval(
+        ks=[1, 5, 10],
+        src_modality=flickr_image_modality,
+        tgt_modality=flickr_text_modality,
+    )
+
+    coco_t2i_retrieval = Retrieval(
+        ks=[1, 5, 10],
+        src_modality=coco_text_modality,
+        tgt_modality=coco_image_modality,
+    )
+
+    coco_i2t_retrieval = Retrieval(
+        ks=[1, 5, 10],
+        src_modality=coco_image_modality,
+        tgt_modality=coco_text_modality,
+    )
+
+    fiq_dress_retrieval = Retrieval(
+        ks=[10, 50],
+        src_modality=fiq_dress_query_modality,
+        tgt_modality=fiq_dress_image_modality,
+    )
+
+    fiq_shirt_retrieval = Retrieval(
+        ks=[10, 50],
+        src_modality=fiq_shirt_query_modality,
+        tgt_modality=fiq_shirt_image_modality,
+    )
+
+    fiq_toptee_retrieval = Retrieval(
+        ks=[10, 50],
+        src_modality=fiq_toptee_query_modality,
+        tgt_modality=fiq_toptee_image_modality,
+    )
+
+    cirr_retrieval = Retrieval(
+        ks=[1, 5, 10],
+        src_modality=cirr_text_modality,
+        tgt_modality=cirr_image_modality,
+    )
+
+    retrievals = [
+        flickr_t2i_retrieval,
+        flickr_i2t_retrieval,
+        coco_t2i_retrieval,
+        coco_i2t_retrieval,
+        fiq_dress_retrieval,
+        fiq_shirt_retrieval,
+        fiq_toptee_retrieval,
+        cirr_retrieval,
+    ]
+
+    model = Lazy(lambda: init_model(lora_path))
+
+    for retrieval in retrievals:
+        src_modality = retrieval.src_modality
+        tgt_modality = retrieval.tgt_modality
+
+        mod1_embs, mod1_idx = modality_to_embed(
+            transform, model, src_modality, lora_path
+        )
+
+        mod2_embs, mod2_idx = modality_to_embed(
+            transform, model, tgt_modality, lora_path
+        )
+
+        scores = calculate_score(mod1_embs, mod2_embs)
+        positive_pairs = calculate_pos_pairs(mod1_idx, mod2_idx)
+
+        metric_file_path = Path(lora_path) / "metrics.txt"
+        if accelerator.is_main_process:
+            src_modality_name = f"{src_modality.dataset_name}::{src_modality.name}"
+            tgt_modality_name = f"{tgt_modality.dataset_name}::{tgt_modality.name}"
+            to_print = f"{src_modality_name} -> {tgt_modality_name}\n"
+            tee(metric_file_path, to_print)
+        for k in retrieval.ks:
+            recall = recall_at_k(scores, positive_pairs, k)
+            recall = recall.mean().item()
+            if accelerator.is_main_process:
+                to_print = f"    R @ {k:2}: {recall:.4f}\n"
+                tee(metric_file_path, to_print)
+
+    accelerator.end_training()
 
 
 if __name__ == "__main__":
