@@ -19,6 +19,7 @@ from torch.utils import data
 from tqdm import tqdm
 from transformers import LlavaNextProcessor
 
+from data import prompt_image_text, prompt_text
 from ft_llm import LlavaNextCustom
 
 accelerator = Accelerator()
@@ -252,25 +253,6 @@ def recall_at_k(scores, positive_pairs, k, transpose=False):
     recall = (recall > 0).float()
     return recall
 
-
-def prompt_text(text):
-    cont = [
-        {"type": "text", "text": text},
-    ]
-    return prompt_user(cont)
-
-
-def prompt_image_text(text):
-    cont = [
-        {"type": "image"},
-        {"type": "text", "text": text},
-    ]
-    return prompt_user(cont)
-
-
-def prompt_user(cont):
-    msg = {"role": "user", "content": cont}
-    return [msg]
 
 
 def custom_collate_fn(batch, transform):

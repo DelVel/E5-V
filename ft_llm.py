@@ -1,6 +1,8 @@
 import contextlib
 import os
 
+import datasets
+from einops import rearrange
 import fire
 import torch
 import torch.distributed as dist
@@ -12,16 +14,18 @@ from transformers import (
     BitsAndBytesConfig,
     LlavaNextForConditionalGeneration,
     LlavaNextProcessor,
-    PreTrainedTokenizerFast,
     Trainer,
     set_seed,
 )
 
+from data import prompt_image_text, prompt_text
+
 
 class LlavaNextCustom(LlavaNextForConditionalGeneration):
     """
-    A custom model that allows inputs without pixel values.
+    A custom model that allows both image and text inputs to be processed
     """
+
     def forward(self, *args, **kwargs):
         pixel_values = kwargs.get("pixel_values", None)
         if pixel_values is not None:
@@ -63,82 +67,68 @@ class PgroupContext:
         torch.distributed.destroy_process_group()
 
 
-class DataTransform:
-    def __init__(self, tokenizer):
-        self._tokenizer: PreTrainedTokenizerFast = tokenizer
-
-    def __call__(self, string):
-        return {
-            k: self._tokenizer.batch_decode(
-                self._tokenizer(
-                    v,
-                    truncation=True,
-                    max_length=32,
-                    add_special_tokens=False,
-                )["input_ids"]
-            )
-            for k, v in string.items()
-        }
-
-
 class DataCollator:
-    _keys = ("sent0", "sent1", "hard_neg")
-
     def __init__(self, processor):
         self._processor: LlavaNextProcessor = processor
 
     def __call__(self, data_):
-        flattened_data = [x[k] for k in self._keys for x in data_]
-        templated = self._processor.apply_chat_template(
-            [self._get_templated_prompt(x) for x in flattened_data],
+        text = [x["txt"] for x in data_]
+        text = self._processor.batch_decode(
+            self._processor(
+                text=text,
+                truncation=True,
+                max_length=32,
+                add_special_tokens=False,
+            )["input_ids"]
+        )
+
+        text_templated = self._processor.apply_chat_template(
+            [prompt_text(f"{x}\nSummary above sentence in one word:") for x in text],
             add_generation_prompt=True,
         )
-        return self._processor(
+
+        images = [x["jpg"] for x in data_]
+
+        images_templated = self._processor.apply_chat_template(
+            [prompt_image_text("Summary above image in one word:") for _ in images],
+            add_generation_prompt=True,
+        )
+        images_processed = self._processor(
+            images=images,
+            text=images_templated + text_templated,
             pad_to_multiple_of=8,
             padding=True,
             padding_side="left",
             return_tensors="pt",
-            text=templated,
         )
-
-    def _get_templated_prompt(self, x):
-        text_content = {
-            "type": "text",
-            "text": f"{x}\nSummary above sentence in one word:",
-        }
-        user_msg = {"role": "user", "content": [text_content]}
-        return [user_msg]
+        return images_processed
 
 
 class SentembTrainer(Trainer):
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
     ):
-        pooler_output = model(
-            output_hidden_states=True, return_dict=True, **inputs
+        outputs = model(
+            **inputs, return_dict=True, output_hidden_states=True
         ).hidden_states[-1][:, -1, :]
-
-        batch_size = pooler_output.size(0) // 3
-        assert batch_size * 3 == pooler_output.size(0)
-
-        z1 = pooler_output[:batch_size]
-        z2 = pooler_output[batch_size : 2 * batch_size]
-        z3 = pooler_output[2 * batch_size :]
+        outputs = rearrange(outputs, "(m b) d -> m b d", m=2)
+        img_outputs, txt_outputs = outputs[0], outputs[1]
 
         if dist.is_initialized():
-            z1 = all_gather_with_grad(z1.contiguous())
-            z2 = all_gather_with_grad(z2.contiguous())
-            z3 = all_gather_with_grad(z3.contiguous())
+            img_outputs = all_gather_with_grad(img_outputs.contiguous())
+            txt_outputs = all_gather_with_grad(txt_outputs.contiguous())
 
-        query = z1.unsqueeze_(1)
-        target = torch.cat([z2.unsqueeze_(0), z3.unsqueeze_(0)], 1)
+        query = img_outputs.unsqueeze_(1)
+        target = txt_outputs.unsqueeze_(0)
         cos_sim = F.cosine_similarity(query, target, dim=-1) / 0.05
 
         labels = torch.arange(cos_sim.size(0), dtype=torch.long, device=cos_sim.device)
 
-        loss = F.cross_entropy(cos_sim, labels)
+        loss = (
+            F.cross_entropy(cos_sim, labels) + F.cross_entropy(cos_sim.t(), labels)
+        ) / 2
 
-        return (loss, z1, z2, z3) if return_outputs else loss
+        return (loss, txt_outputs, img_outputs) if return_outputs else loss
 
 
 def get_model(
@@ -185,21 +175,15 @@ def get_model(
     return model
 
 
-def get_data(data_path, world_size, processor):
-    data = load_dataset("csv", data_files=data_path)
-    data_transform = DataTransform(processor.tokenizer)
-    train_data = (
-        data["train"]
-        .shuffle()
-        .map(data_transform, num_proc=os.cpu_count() // world_size, batched=True)
-    )
-
-    return train_data
+def get_data():
+    cc3m = load_dataset("pixparse/cc3m-wds", split="train")
+    cc3m = cc3m.shuffle()
+    cc3m = cc3m.remove_columns(["__key__", "__url__"])
+    return cc3m
 
 
 def train(
     # model/data params
-    data_path: str = "data/nli_for_simcse.csv",
     output_dir: str = "./lora-alpaca",
     # training hyperparams
     batch_size: int = 256,
@@ -223,6 +207,11 @@ def train(
 ):
     set_seed(seed)
 
+    if local_rank is not None and local_rank != 0:
+        transformers.utils.logging.disable_progress_bar()
+        datasets.disable_progress_bars()
+        print(f"Disabling progress bars for rank {local_rank}")
+
     fp16 = True if not bf16 else False
     model_dtype = torch.bfloat16 if bf16 else torch.float16
     gradient_accumulation_steps = batch_size // micro_batch_size
@@ -239,10 +228,30 @@ def train(
 
     model_name = "llava-hf/llama3-llava-next-8b-hf"
     processor: LlavaNextProcessor = LlavaNextProcessor.from_pretrained(model_name)
-    train_data = get_data(data_path, world_size, processor)
+    train_data = get_data()
     data_collator = DataCollator(processor)
 
     with pgroup_context, torch.cuda.device(device):
+        args = transformers.TrainingArguments(
+            bf16=bf16,
+            ddp_find_unused_parameters=False if ddp else None,
+            deepspeed=deepspeed,
+            fp16=fp16,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            gradient_checkpointing=grad_checkpoint,
+            gradient_checkpointing_kwargs={"use_reentrant": True},
+            learning_rate=learning_rate,
+            logging_steps=logging_steps,
+            num_train_epochs=num_epochs,
+            output_dir=output_dir,
+            per_device_train_batch_size=micro_batch_size,
+            remove_unused_columns=False,
+            run_name=output_dir,
+            save_steps=save_steps,
+            save_strategy="steps",
+            save_total_limit=3,
+            warmup_steps=100,
+        )
         model = get_model(
             model_name,
             lora_r,
@@ -253,32 +262,12 @@ def train(
             model_dtype,
             device,
         )
-
         trainer = SentembTrainer(
-            model=model,
-            train_dataset=train_data,
+            args=args,
             data_collator=data_collator,
+            model=model,
             processing_class=processor,
-            args=transformers.TrainingArguments(
-                bf16=bf16,
-                ddp_find_unused_parameters=False if ddp else None,
-                deepspeed=deepspeed,
-                fp16=fp16,
-                gradient_accumulation_steps=gradient_accumulation_steps,
-                gradient_checkpointing=grad_checkpoint,
-                gradient_checkpointing_kwargs={"use_reentrant": True},
-                learning_rate=learning_rate,
-                logging_steps=logging_steps,
-                num_train_epochs=num_epochs,
-                output_dir=output_dir,
-                per_device_train_batch_size=micro_batch_size,
-                remove_unused_columns=False,
-                run_name=output_dir,
-                save_steps=save_steps,
-                save_strategy="steps",
-                save_total_limit=100,
-                warmup_steps=100,
-            ),
+            train_dataset=train_data,
         )
         trainer.train()
         model.save_pretrained(output_dir)
