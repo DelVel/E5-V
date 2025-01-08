@@ -1,19 +1,21 @@
 import contextlib
 import os
+from dataclasses import dataclass
 
 import datasets
-from einops import rearrange
-import fire
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import transformers
 from datasets import load_dataset
+from einops import rearrange
+from jsonargparse import CLI
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import (
     BitsAndBytesConfig,
-    LlavaNextForConditionalGeneration,
-    LlavaNextProcessor,
+    LlavaConfig,
+    LlavaForConditionalGeneration,
+    LlavaProcessor,
     Trainer,
     set_seed,
 )
@@ -21,7 +23,7 @@ from transformers import (
 from data import prompt_image_text, prompt_text
 
 
-class LlavaNextCustom(LlavaNextForConditionalGeneration):
+class LlavaCustom(LlavaForConditionalGeneration):
     """
     A custom model that allows both image and text inputs to be processed
     """
@@ -56,20 +58,16 @@ def all_gather_with_grad(tensors):
     return torch.cat(GatherLayer.apply(tensors))
 
 
-class PgroupContext:
-    def __init__(self, device_id):
-        self._device_id = device_id
-
-    def __enter__(self):
-        torch.distributed.init_process_group("nccl", device_id=self._device_id)
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        torch.distributed.destroy_process_group()
+@contextlib.contextmanager
+def pgroup_context(device_id):
+    torch.distributed.init_process_group("nccl", device_id=device_id)
+    yield
+    torch.distributed.destroy_process_group()
 
 
 class DataCollator:
     def __init__(self, processor):
-        self._processor: LlavaNextProcessor = processor
+        self._processor: LlavaProcessor = processor
 
     def __call__(self, data_):
         text = [x["txt"] for x in data_]
@@ -109,7 +107,7 @@ class SentembTrainer(Trainer):
         self, model, inputs, return_outputs=False, num_items_in_batch=None
     ):
         outputs = model(
-            **inputs, return_dict=True, output_hidden_states=True
+            **inputs, return_dict=True, output_hidden_states=True, use_cache=False
         ).hidden_states[-1][:, -1, :]
         outputs = rearrange(outputs, "(m b) d -> m b d", m=2)
         img_outputs, txt_outputs = outputs[0], outputs[1]
@@ -131,17 +129,31 @@ class SentembTrainer(Trainer):
         return (loss, txt_outputs, img_outputs) if return_outputs else loss
 
 
+@dataclass
+class LoraParams:
+    r: int
+    alpha: int
+    dropout: float
+    target_modules: list[str]
+
+
+def get_processor(model_name):
+    processor = LlavaProcessor.from_pretrained(model_name)
+    processor.chat_template = "{% for message in messages %}{{ '<|' + message['role'] + '|>\n'}}{% for content in message['content'] | selectattr('type', 'equalto', 'image') %}{{ '<image>' }}{% endfor %}{% for content in message['content'] | selectattr('type', 'equalto', 'text') %}{{ '\n' + content['text'] + '<|end|>\n' }}{% endfor %}{% endfor %}{% if add_generation_prompt %}{{ '<|assistant|>\n' }}{% endif %}"
+    model_cfg = LlavaConfig.from_pretrained(model_name)
+    processor.patch_size = model_cfg.vision_config.patch_size
+    processor.vision_feature_select_strategy = model_cfg.vision_feature_select_strategy
+    return processor
+
+
 def get_model(
     model_name,
-    lora_r,
-    lora_alpha,
-    lora_dropout,
-    lora_target_modules,
+    lora_params: LoraParams,
     grad_checkpoint,
     model_dtype,
     device,
 ):
-    model = LlavaNextCustom.from_pretrained(
+    model = LlavaCustom.from_pretrained(
         model_name,
         torch_dtype=model_dtype,
         device_map=device,
@@ -155,18 +167,15 @@ def get_model(
         ),
     )
 
-    if grad_checkpoint:
-        model.enable_input_require_grads()
-
     model = prepare_model_for_kbit_training(model)
     model = get_peft_model(
         model,
         LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            target_modules=lora_target_modules,
+            r=lora_params.r,
+            lora_alpha=lora_params.alpha,
+            lora_dropout=lora_params.dropout,
+            target_modules=lora_params.target_modules,
             exclude_modules="^(?!language_model).*$",
-            lora_dropout=lora_dropout,
             bias="none",
             task_type="CAUSAL_LM",
         ),
@@ -175,7 +184,7 @@ def get_model(
     return model
 
 
-def get_data():
+def get_dataset():
     cc3m = load_dataset("pixparse/cc3m-wds", split="train")
     cc3m = cc3m.shuffle()
     cc3m = cc3m.remove_columns(["__key__", "__url__"])
@@ -183,27 +192,21 @@ def get_data():
 
 
 def train(
-    # model/data params
-    output_dir: str = "./lora-alpaca",
+    output_dir: str,
+    lora: LoraParams,
     # training hyperparams
-    batch_size: int = 256,
-    micro_batch_size: int = 64,
+    per_device_train_batch_size: int = 64,
+    gradient_accumulation_steps: int = 1,
     num_epochs: int = 1,
     learning_rate: float = 5e-4,
-    # lora hyperparams
-    lora_r: int = 64,
-    lora_alpha: int = 16,
-    lora_dropout: float = 0.05,
-    lora_target_modules: list[str] = None,
     # llm hyperparams
     save_steps: int = 100,
     seed: int = 42,
     deepspeed: str = None,
-    logging_steps: int = 10,
     grad_checkpoint: bool = True,
     bf16: bool = True,
     # ddp vars
-    local_rank: str = None,
+    local_rank: int = None,
 ):
     set_seed(seed)
 
@@ -214,24 +217,24 @@ def train(
 
     fp16 = True if not bf16 else False
     model_dtype = torch.bfloat16 if bf16 else torch.float16
-    gradient_accumulation_steps = batch_size // micro_batch_size
     device = torch.device("cuda")
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     ddp = world_size != 1
-    pgroup_context = contextlib.nullcontext()
+    nccl_ctx = contextlib.nullcontext()
 
     if ddp:
-        assert local_rank is not None and isinstance(local_rank, int)
-        gradient_accumulation_steps = gradient_accumulation_steps // world_size
+        assert local_rank is not None and isinstance(
+            local_rank, int
+        ), f"Invalid rank {local_rank}:{type(local_rank)}"
         device = torch.device("cuda", local_rank)
-        pgroup_context = PgroupContext(device)
+        nccl_ctx = pgroup_context(device)
 
-    model_name = "llava-hf/llama3-llava-next-8b-hf"
-    processor: LlavaNextProcessor = LlavaNextProcessor.from_pretrained(model_name)
-    train_data = get_data()
+    model_name = "xtuner/llava-phi-3-mini-hf"
+    processor = get_processor(model_name)
+    train_data = get_dataset()
     data_collator = DataCollator(processor)
 
-    with pgroup_context, torch.cuda.device(device):
+    with nccl_ctx, torch.cuda.device(device):
         args = transformers.TrainingArguments(
             bf16=bf16,
             ddp_find_unused_parameters=False if ddp else None,
@@ -241,10 +244,10 @@ def train(
             gradient_checkpointing=grad_checkpoint,
             gradient_checkpointing_kwargs={"use_reentrant": True},
             learning_rate=learning_rate,
-            logging_steps=logging_steps,
+            logging_steps=1,
             num_train_epochs=num_epochs,
             output_dir=output_dir,
-            per_device_train_batch_size=micro_batch_size,
+            per_device_train_batch_size=per_device_train_batch_size,
             remove_unused_columns=False,
             run_name=output_dir,
             save_steps=save_steps,
@@ -254,10 +257,7 @@ def train(
         )
         model = get_model(
             model_name,
-            lora_r,
-            lora_alpha,
-            lora_dropout,
-            lora_target_modules,
+            lora,
             grad_checkpoint,
             model_dtype,
             device,
@@ -274,4 +274,4 @@ def train(
 
 
 if __name__ == "__main__":
-    fire.Fire(train)
+    CLI(train)

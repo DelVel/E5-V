@@ -7,3 +7,5 @@
 /*.ipynb
 /.gradio
 /.cache
+/metrics
+/llava-*

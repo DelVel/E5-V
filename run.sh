@@ -1,17 +1,16 @@
-RUN=e5v-8b-cross-modal-contra
-
 wandb online
 HF_HOME=.cache/hf deepspeed ft_llm.py \
-        --batch_size 32 \
-        --data_path 'data/nli_for_simcse.csv' \
+        llava-3b-cross-modal-contra-lr=4e-6-fp16 \
+        \
+        --lora.alpha 64 \
+        --lora.dropout 0.05 \
+        --lora.r 8 \
+        --lora.target_modules '[q_proj,k_proj,v_proj,o_proj,gate_proj,down_proj,up_proj]' \
+        \
+        --per_device_train_batch_size 32 \
+        --gradient_accumulation_steps 1 \
         --deepspeed ds.config \
-        --learning_rate 4e-4 \
-        --logging_steps 1 \
-        --lora_alpha 16 \
-        --lora_dropout 0.05 \
-        --lora_r 64 \
-        --lora_target_modules q_proj,k_proj,v_proj,o_proj,gate_proj,down_proj,up_proj \
-        --micro_batch_size 8 \
-        --num_epochs 2 \
-        --output_dir $RUN \
+        --learning_rate 4e-6 \
+        --num_epochs 1 \
+        \
         --save_steps 100

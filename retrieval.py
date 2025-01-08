@@ -1,3 +1,5 @@
+import datetime
+import os
 from dataclasses import dataclass
 from itertools import permutations
 from os import cpu_count
@@ -17,10 +19,10 @@ from peft import PeftModel
 from torch.distributed.elastic.multiprocessing import errors
 from torch.utils import data
 from tqdm import tqdm
-from transformers import LlavaNextProcessor
+from transformers import LlavaConfig, LlavaProcessor
 
 from data import prompt_image_text, prompt_text
-from ft_llm import LlavaNextCustom
+from ft_llm import LlavaCustom
 
 accelerator = Accelerator()
 
@@ -254,7 +256,6 @@ def recall_at_k(scores, positive_pairs, k, transpose=False):
     return recall
 
 
-
 def custom_collate_fn(batch, transform):
     coll = {}
     for key in batch[0]:
@@ -296,17 +297,21 @@ def map_to_embed(model, dataloader):
 
 
 def init_transform():
-    transform = LlavaNextProcessor.from_pretrained("llava-hf/llama3-llava-next-8b-hf")
+    transform = LlavaProcessor.from_pretrained("xtuner/llava-phi-3-mini-hf")
+    transform.chat_template = "{% for message in messages %}{{ '<|' + message['role'] + '|>\n'}}{% for content in message['content'] | selectattr('type', 'equalto', 'image') %}{{ '<image>' }}{% endfor %}{% for content in message['content'] | selectattr('type', 'equalto', 'text') %}{{ '\n' + content['text'] + '<|end|>\n' }}{% endfor %}{% endfor %}{% if add_generation_prompt %}{{ '<|assistant|>\n' }}{% endif %}"
     transform.tokenizer.padding_side = "left"
     transform.tokenizer.padding = True
+    model_cfg = LlavaConfig.from_pretrained("xtuner/llava-phi-3-mini-hf")
+    transform.patch_size = model_cfg.vision_config.patch_size
+    transform.vision_feature_select_strategy = model_cfg.vision_feature_select_strategy
     return transform
 
 
 def init_model(lora_path):
     rank = dist.get_rank()
     with torch.cuda.device(rank):
-        model = LlavaNextCustom.from_pretrained(
-            "llava-hf/llama3-llava-next-8b-hf",
+        model = LlavaCustom.from_pretrained(
+            "xtuner/llava-phi-3-mini-hf",
             torch_dtype=torch.bfloat16,
             low_cpu_mem_usage=True,
             device_map=rank,
@@ -341,7 +346,8 @@ def tee(metric_file_path, to_print):
 
 
 def modality_to_embed(transform, model, modality: Modality, lora_path):
-    path_ = Path(lora_path)
+    path_ = Path(lora_path) / "emb_cache"
+    path_.mkdir(exist_ok=True)
     emb_path = path_ / f"{modality.dataset_name},{modality.name}.pt"
     idx_path = path_ / f"{modality.dataset_name},{modality.name}.npy"
     if emb_path.exists() and idx_path.exists():
@@ -355,18 +361,19 @@ def modality_to_embed(transform, model, modality: Modality, lora_path):
 
     if accelerator.is_main_process:
         print(f"Embedding `{modality.dataset_name}::{modality.name}`.")
-    mod1 = modality.dataset()
-    mod1_dataloader = get_dataloader(mod1, transform)
-    mod1_embs, mod1_idx = map_to_embed(model, mod1_dataloader)
-    mod1_embs, mod1_idx = modality.on_embed_done(mod1_embs, mod1_idx)
+    dataset = modality.dataset()
+    dataloader = get_dataloader(dataset, transform)
+    emb, idx = map_to_embed(model, dataloader)
+    emb, idx = modality.on_embed_done(emb, idx)
     if accelerator.is_main_process:
-        torch.save(mod1_embs, str(emb_path))
-        np.save(str(idx_path), mod1_idx)
-    return mod1_embs, mod1_idx
+        torch.save(emb, str(emb_path))
+        np.save(str(idx_path), idx)
+    return emb, idx
 
 
 @errors.record
 def main(lora_path: str = None):
+    start = datetime.datetime.now()
     if not accelerator.is_main_process:
         transformers.utils.logging.disable_progress_bar()
         datasets.disable_progress_bars()
@@ -504,7 +511,9 @@ def main(lora_path: str = None):
         cirr_retrieval,
     ]
 
-    model = Lazy(lambda: init_model(lora_path))
+    model = Lazy(lambda x=lora_path: init_model(x))
+    lora_path = lora_path or "metrics"
+    os.makedirs(lora_path, exist_ok=True)
 
     for retrieval in retrievals:
         src_modality = retrieval.src_modality
@@ -534,6 +543,10 @@ def main(lora_path: str = None):
                 to_print = f"    R @ {k:2}: {recall:.4f}\n"
                 tee(metric_file_path, to_print)
 
+    if accelerator.is_main_process:
+        end = datetime.datetime.now()
+        duration = end - start
+        print(f"Duration: {duration}")
     accelerator.end_training()
 
 
