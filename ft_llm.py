@@ -240,7 +240,7 @@ def main(
         )
         if accelerator.is_main_process:
             model.print_trainable_parameters()
-        
+
         train_data = get_dataset()
         data_collator = DataCollator(processor)
         trainer = SentembTrainer(
@@ -251,8 +251,8 @@ def main(
             train_dataset=train_data,
         )
         trainer.train(resume_from_checkpoint=resume_from_checkpoint)
-        model.save_pretrained(output_dir, is_main_process=accelerator.is_main_process)
     finally:
+        trainer.save_model()
         accelerator.end_training()
 
 
