@@ -1,7 +1,8 @@
-import contextlib
-import os
 from dataclasses import dataclass
+from pathlib import Path
 
+import accelerate
+from torch.distributed.elastic.multiprocessing import errors
 import datasets
 import torch
 import torch.distributed as dist
@@ -56,13 +57,6 @@ def all_gather_with_grad(tensors):
     if world_size == 1:
         return tensors
     return torch.cat(GatherLayer.apply(tensors))
-
-
-@contextlib.contextmanager
-def pgroup_context(device_id):
-    torch.distributed.init_process_group("nccl", device_id=device_id)
-    yield
-    torch.distributed.destroy_process_group()
 
 
 class DataCollator:
@@ -149,14 +143,12 @@ def get_processor(model_name):
 def get_model(
     model_name,
     lora_params: LoraParams,
-    grad_checkpoint,
     model_dtype,
-    device,
 ):
     model = LlavaCustom.from_pretrained(
         model_name,
         torch_dtype=model_dtype,
-        device_map=device,
+        low_cpu_mem_usage=True,
         attn_implementation="flash_attention_2",
         quantization_config=BitsAndBytesConfig(
             bnb_4bit_compute_dtype=model_dtype,
@@ -180,7 +172,6 @@ def get_model(
             task_type="CAUSAL_LM",
         ),
     )
-    model.print_trainable_parameters()
     return model
 
 
@@ -191,7 +182,9 @@ def get_dataset():
     return cc3m
 
 
-def train(
+@errors.record
+def main(
+    run_name: str,
     output_dir: str,
     lora: LoraParams,
     # training hyperparams
@@ -199,49 +192,31 @@ def train(
     gradient_accumulation_steps: int = 1,
     num_epochs: int = 1,
     learning_rate: float = 5e-4,
-    # llm hyperparams
-    save_steps: int = 100,
-    seed: int = 42,
-    deepspeed: str = None,
-    grad_checkpoint: bool = True,
     bf16: bool = True,
-    # ddp vars
-    local_rank: int = None,
+    # trainer parameters
+    resume_from_checkpoint: bool = False,
 ):
-    set_seed(seed)
+    accelerator = accelerate.Accelerator()
+    try:
+        set_seed(42)
 
-    if local_rank is not None and local_rank != 0:
-        transformers.utils.logging.disable_progress_bar()
-        datasets.disable_progress_bars()
-        print(f"Disabling progress bars for rank {local_rank}")
+        if not accelerator.is_main_process:
+            transformers.utils.logging.disable_progress_bar()
+            datasets.disable_progress_bars()
+        else:
+            print("Progress bars are disabled in non-main processes.")
 
-    fp16 = True if not bf16 else False
-    model_dtype = torch.bfloat16 if bf16 else torch.float16
-    device = torch.device("cuda")
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    ddp = world_size != 1
-    nccl_ctx = contextlib.nullcontext()
-
-    if ddp:
-        assert local_rank is not None and isinstance(
-            local_rank, int
-        ), f"Invalid rank {local_rank}:{type(local_rank)}"
-        device = torch.device("cuda", local_rank)
-        nccl_ctx = pgroup_context(device)
-
-    model_name = "xtuner/llava-phi-3-mini-hf"
-    processor = get_processor(model_name)
-    train_data = get_dataset()
-    data_collator = DataCollator(processor)
-
-    with nccl_ctx, torch.cuda.device(device):
+        output_dir: Path = Path(output_dir) / run_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = str(output_dir)
         args = transformers.TrainingArguments(
             bf16=bf16,
-            ddp_find_unused_parameters=False if ddp else None,
-            deepspeed=deepspeed,
-            fp16=fp16,
+            dataloader_num_workers=4,
+            ddp_find_unused_parameters=False,
+            deepspeed="ds_config.json",
+            fp16=not bf16,
             gradient_accumulation_steps=gradient_accumulation_steps,
-            gradient_checkpointing=grad_checkpoint,
+            gradient_checkpointing=True,
             gradient_checkpointing_kwargs={"use_reentrant": True},
             learning_rate=learning_rate,
             logging_steps=1,
@@ -249,19 +224,25 @@ def train(
             output_dir=output_dir,
             per_device_train_batch_size=per_device_train_batch_size,
             remove_unused_columns=False,
-            run_name=output_dir,
-            save_steps=save_steps,
+            run_name=run_name,
+            save_steps=100,
             save_strategy="steps",
             save_total_limit=3,
             warmup_steps=100,
         )
+
+        model_name = "xtuner/llava-phi-3-mini-hf"
+        processor = get_processor(model_name)
         model = get_model(
             model_name,
             lora,
-            grad_checkpoint,
-            model_dtype,
-            device,
+            torch.bfloat16 if bf16 else torch.float16,
         )
+        if accelerator.is_main_process:
+            model.print_trainable_parameters()
+        
+        train_data = get_dataset()
+        data_collator = DataCollator(processor)
         trainer = SentembTrainer(
             args=args,
             data_collator=data_collator,
@@ -269,9 +250,11 @@ def train(
             processing_class=processor,
             train_dataset=train_data,
         )
-        trainer.train()
-        model.save_pretrained(output_dir)
+        trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+        model.save_pretrained(output_dir, is_main_process=accelerator.is_main_process)
+    finally:
+        accelerator.end_training()
 
 
 if __name__ == "__main__":
-    CLI(train)
+    CLI(main)
