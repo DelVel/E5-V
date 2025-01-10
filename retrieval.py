@@ -1,18 +1,15 @@
 import datetime
 import os
 from dataclasses import dataclass
-from itertools import permutations
 from os import cpu_count
 from pathlib import Path
 
 import datasets
 import numpy as np
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 import transformers
 from accelerate import Accelerator
-from datasets import load_dataset
 from einops import rearrange, reduce
 from fire import Fire
 from peft import PeftModel
@@ -21,7 +18,18 @@ from torch.utils import data
 from tqdm import tqdm
 from transformers import LlavaConfig, LlavaProcessor
 
-from data import prompt_image_text, prompt_text
+from data import (
+    custom_collate_fn,
+    get_cirr_image_dataset,
+    get_cirr_text_dataset,
+    get_coco_image_dataset,
+    get_coco_text_dataset,
+    get_fiq_image_dataset,
+    get_fiq_text_dataset,
+    get_flickr_image_dataset,
+    get_flickr_text_dataset,
+    recall_at_k,
+)
 from ft_llm import LlavaCustom
 
 accelerator = Accelerator()
@@ -67,207 +75,11 @@ class Retrieval:
     tgt_modality: Modality
 
 
-def ir_text_map(x, ind, transform):
-    text = [
-        prompt_text(f"{y}\nSummary above sentence in one word:")
-        for q in x["text"]
-        for y in q
-    ]
-    return {
-        **batch_apply_chat_template(transform, text),
-        "index": [f"{i}" for i, q in zip(ind, x["text"]) for _ in q],
-    }
-
-
-def ir_image_map(x, ind, transform):
-    text = [prompt_image_text("Summary above image in one word:") for _ in ind]
-    return {
-        **batch_apply_chat_template(transform, text),
-        "index": [f"{y}" for y in ind],
-    }
-
-
-def fiq_dataset_map(x, ind, transform, style):
-    tid = x["index"]
-    img = x["images"]
-    cap = x["text"]
-
-    res_idx = []
-    res_txt = []
-    res_img = []
-    for t, i, c in zip(tid, img, cap):
-        for c_perm in permutations(c):
-            res_idx.append(t)
-            res_img.append(i)
-            caption = ", ".join(cc.strip(".?, ") for cc in c_perm)
-            caption = prompt_image_text(
-                f"Change the style of this {style} to {caption}\nDescribe this modified {style} in one word based on its style:"
-            )
-            res_txt.append(caption)
-    res_txt = transform.apply_chat_template(res_txt, add_generation_prompt=True)
-    return {"index": res_idx, "images": res_img, "text": res_txt}
-
-
-def cirr_text_map(x, ind, transform):
-    text = [
-        prompt_image_text(
-            f'Modify this image with "{y}", describe modified image in one word:'
-        )
-        for y in x["text"]
-    ]
-    return batch_apply_chat_template(transform, text)
-
-
-def fiq_image_map(x, ind, transform, style):
-    text = [
-        prompt_image_text(f"Describe this {style} in one word based on its style:")
-        for _ in ind
-    ]
-    return batch_apply_chat_template(transform, text)
-
-
-def cirr_image_map(x, ind, transform):
-    text = [prompt_image_text("Describe this image in one word:") for _ in ind]
-    return batch_apply_chat_template(transform, text)
-
-
-def batch_apply_chat_template(transform, text):
-    return {
-        "text": transform.apply_chat_template(
-            text,
-            add_generation_prompt=True,
-        ),
-    }
-
-
-def get_flickr_text_dataset(transform):
-    return (
-        load_dataset("royokong/flickr30k_test", split="test")
-        .remove_columns("image")
-        .map(
-            lambda x, ind: ir_text_map(x, ind, transform),
-            batched=True,
-            with_indices=True,
-        )
-    )
-
-
-def get_flickr_image_dataset(transform):
-    return (
-        load_dataset("royokong/flickr30k_test", split="test")
-        .rename_column("image", "images")
-        .map(
-            lambda x, ind: ir_image_map(x, ind, transform),
-            batched=True,
-            with_indices=True,
-        )
-    )
-
-
-def get_coco_text_dataset(transform):
-    return (
-        load_dataset("royokong/coco_test", split="test")
-        .remove_columns("image")
-        .map(
-            lambda x, ind: ir_text_map(x, ind, transform),
-            batched=True,
-            with_indices=True,
-        )
-    )
-
-
-def get_coco_image_dataset(transform):
-    return (
-        load_dataset("royokong/coco_test", split="test")
-        .rename_column("image", "images")
-        .map(
-            lambda x, ind: ir_image_map(x, ind, transform),
-            batched=True,
-            with_indices=True,
-        )
-    )
-
-
-def get_fiq_text_dataset(transform, style):
-    return (
-        load_dataset("royokong/fashioniq_val", split="val")
-        .filter(lambda x: map(lambda y: y == style, x["category"]), batched=True)
-        .remove_columns(["candidate_id", "category", "split", "target"])
-        .rename_columns(
-            {"candidate": "images", "caption": "text", "target_id": "index"}
-        )
-        .map(
-            lambda x, ind: fiq_dataset_map(x, ind, transform, style),
-            batched=True,
-            with_indices=True,
-        )
-    )
-
-
-def get_fiq_image_dataset(transform, style):
-    return (
-        load_dataset("royokong/fashioniq_val_imgs", split="val")
-        .filter(lambda x: map(lambda y: y == style, x["category"]), batched=True)
-        .remove_columns(["category", "split"])
-        .rename_columns({"id": "index", "img": "images"})
-        .map(
-            lambda x, ind: fiq_image_map(x, ind, transform, style),
-            batched=True,
-            with_indices=True,
-        )
-    )
-
-
-def get_cirr_text_dataset(transform):
-    return (
-        load_dataset("royokong/cirr_val", split="val")
-        .remove_columns(["candidate_id", "group", "split", "target"])
-        .rename_columns(
-            {"target_id": "index", "candidate": "images", "caption": "text"}
-        )
-        .map(
-            lambda x, ind: cirr_text_map(x, ind, transform),
-            batched=True,
-            with_indices=True,
-        )
-    )
-
-
-def get_cirr_image_dataset(transform):
-    return (
-        load_dataset("royokong/cirr_imgs", split="val")
-        .remove_columns(["category", "split"])
-        .rename_columns({"id": "index", "img": "images"})
-        .map(
-            lambda x, ind: cirr_image_map(x, ind, transform),
-            batched=True,
-            with_indices=True,
-        )
-    )
-
-
-def recall_at_k(scores, positive_pairs, k, transpose=False):
-    dim = 0 if transpose else 1
-    topk_indices = scores.topk(k, dim=dim).indices
-    nb_true_positive = positive_pairs.sum(dim=dim)
-    nb_retrieved_positive = positive_pairs.gather(dim, topk_indices).sum(dim=dim)
-    recall = nb_retrieved_positive / nb_true_positive
-    recall = (recall > 0).float()
-    return recall
-
-
-def custom_collate_fn(batch, transform):
-    coll = {}
-    for key in batch[0]:
-        coll[key] = [x[key] for x in batch]
-    indices = coll.pop("index")
-    return transform(**coll, return_tensors="pt", padding=True), np.array(indices)
-
 
 def get_dataloader(dataset, transform):
     dataloader = data.DataLoader(
         dataset,
-        batch_size=2,
+        batch_size=16,
         shuffle=False,
         num_workers=cpu_count() // accelerator.num_processes,
         collate_fn=lambda x: custom_collate_fn(x, transform),
@@ -308,18 +120,18 @@ def init_transform():
 
 
 def init_model(lora_path):
-    rank = dist.get_rank()
-    with torch.cuda.device(rank):
-        model = LlavaCustom.from_pretrained(
-            "xtuner/llava-phi-3-mini-hf",
-            torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-            device_map=rank,
-        )
-        if lora_path is not None:
-            model = PeftModel.from_pretrained(
-                model, lora_path, torch_device=f"cuda:{rank}"
-            ).merge_and_unload()
+    rank = accelerator.local_process_index
+    model = LlavaCustom.from_pretrained(
+        "xtuner/llava-phi-3-mini-hf",
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
+        device_map=rank,
+        attn_implementation="flash_attention_2",
+    )
+    if lora_path is not None:
+        model = PeftModel.from_pretrained(
+            model, lora_path, torch_device=f"cuda:{rank}"
+        ).merge_and_unload()
     model = model.eval()
     model = accelerator.prepare(model)
     return model

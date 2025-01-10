@@ -1,6 +1,6 @@
 wandb online
-accelerate launch ft_llm.py \
-        lr=1e-5 \
+accelerate launch --config-file accel_train_config.json ft_llm.py \
+        evaltest \
         itc \
         \
         --lora.alpha 64 \
