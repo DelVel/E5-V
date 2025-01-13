@@ -509,8 +509,8 @@ def get_dataset():
 
 @errors.record
 def main(
-    run_name: str,
     output_dir: str,
+    run_name: str,
     lora: LoraParams,
     # training hyperparams
     per_device_train_batch_size: int = 64,

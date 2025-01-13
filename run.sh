@@ -1,6 +1,5 @@
 wandb online
 accelerate launch --config-file accel_train_config.json ft_llm.py \
-        evaltest \
         itc \
         \
         --lora.alpha 64 \
@@ -12,4 +11,5 @@ accelerate launch --config-file accel_train_config.json ft_llm.py \
         --learning_rate 1e-4 \
         --num_epochs 1 \
         --resume_from_checkpoint False \
-        --bf16 False
+        --bf16 False \
+        $@
