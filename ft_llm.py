@@ -27,7 +27,6 @@ from transformers import (
     Trainer,
     set_seed,
 )
-from transformers.data.data_collator import DataCollator
 from transformers.debug_utils import DebugOption
 from transformers.integrations.deepspeed import deepspeed_init
 from transformers.integrations.tpu import tpu_spmd_dataloader
@@ -42,7 +41,6 @@ from data import (
     custom_collate_fn,
     get_fiq_image_dataset,
     get_fiq_text_dataset,
-    prompt_image_text,
     prompt_text,
     recall_at_k,
 )
@@ -88,7 +86,10 @@ class DataCollator:
         self._processor: LlavaProcessor = processor
 
     def __call__(self, data_):
-        text = [x["txt"] for x in data_]
+        sent0 = [x["sent0"] for x in data_]
+        sent1 = [x["sent1"] for x in data_]
+        hard_neg = [x["hard_neg"] for x in data_]
+        text = sent0 + sent1 + hard_neg
         text = self._processor.batch_decode(
             self._processor(
                 text=text,
@@ -102,22 +103,14 @@ class DataCollator:
             [prompt_text(f"{x}\nSummary above sentence in one word:") for x in text],
             add_generation_prompt=True,
         )
-
-        images = [x["jpg"] for x in data_]
-
-        images_templated = self._processor.apply_chat_template(
-            [prompt_image_text("Summary above image in one word:") for _ in images],
-            add_generation_prompt=True,
-        )
-        images_processed = self._processor(
-            images=images,
-            text=images_templated + text_templated,
+        text_processed = self._processor(
+            text=text_templated,
             pad_to_multiple_of=8,
             padding=True,
             padding_side="left",
             return_tensors="pt",
         )
-        return images_processed
+        return text_processed
 
 
 class SentembTrainer(Trainer):
@@ -127,24 +120,28 @@ class SentembTrainer(Trainer):
         outputs = model(
             **inputs, return_dict=True, output_hidden_states=True, use_cache=False
         ).hidden_states[-1][:, -1, :]
-        outputs = rearrange(outputs, "(m b) d -> m b d", m=2)
-        img_outputs, txt_outputs = outputs[0], outputs[1]
+
+        batch_size = outputs.size(0) // 3
+        assert batch_size * 3 == outputs.size(0)
+
+        z1 = outputs[:batch_size]
+        z2 = outputs[batch_size : 2 * batch_size]
+        z3 = outputs[2 * batch_size :]
 
         if dist.is_initialized():
-            img_outputs = all_gather_with_grad(img_outputs.contiguous())
-            txt_outputs = all_gather_with_grad(txt_outputs.contiguous())
+            z1 = all_gather_with_grad(z1.contiguous())
+            z2 = all_gather_with_grad(z2.contiguous())
+            z3 = all_gather_with_grad(z3.contiguous())
 
-        query = img_outputs.unsqueeze_(1)
-        target = txt_outputs.unsqueeze_(0)
+        query = z1.unsqueeze_(1)
+        target = torch.cat([z2.unsqueeze_(0), z3.unsqueeze_(0)], 1)
         cos_sim = F.cosine_similarity(query, target, dim=-1) / 0.05
 
         labels = torch.arange(cos_sim.size(0), dtype=torch.long, device=cos_sim.device)
 
-        loss = (
-            F.cross_entropy(cos_sim, labels) + F.cross_entropy(cos_sim.t(), labels)
-        ) / 2
+        loss = F.cross_entropy(cos_sim, labels)
 
-        return (loss, txt_outputs, img_outputs) if return_outputs else loss
+        return (loss, z1, z2, z3) if return_outputs else loss
 
     def get_eval_dataloader(
         self, eval_dataset: Optional[Union[str, data.Dataset]] = None
@@ -501,10 +498,8 @@ def get_model(
 
 
 def get_dataset():
-    cc3m = load_dataset("pixparse/cc3m-wds", split="train")
-    cc3m = cc3m.shuffle()
-    cc3m = cc3m.remove_columns(["__key__", "__url__"])
-    return cc3m
+    data = load_dataset("csv", data_files="data/nli_for_simcse.csv", split="train")
+    return data
 
 
 @errors.record
@@ -541,7 +536,7 @@ def main(
             deepspeed="ds_config.json",
             eval_strategy="steps",
             report_to="wandb",
-            eval_steps=20,
+            eval_steps=100,
             fp16=not bf16,
             gradient_accumulation_steps=gradient_accumulation_steps,
             gradient_checkpointing=True,

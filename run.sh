@@ -1,6 +1,5 @@
 wandb online
 accelerate launch --config-file accel_train_config.json ft_llm.py \
-        itc \
         \
         --lora.alpha 64 \
         --lora.dropout 0.05 \
