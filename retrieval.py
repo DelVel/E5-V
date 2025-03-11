@@ -16,9 +16,9 @@ from peft import PeftModel
 from torch.distributed.elastic.multiprocessing import errors
 from torch.utils import data
 from tqdm import tqdm
-from transformers import LlavaConfig, LlavaProcessor
+from transformers import LlavaProcessor
 
-from data import (
+from src.data import (
     custom_collate_fn,
     get_cirr_image_dataset,
     get_cirr_text_dataset,
@@ -30,7 +30,7 @@ from data import (
     get_flickr_text_dataset,
     recall_at_k,
 )
-from ft_llm import LlavaCustom
+from src.model import LlavaCustom
 
 accelerator = Accelerator()
 
@@ -75,7 +75,6 @@ class Retrieval:
     tgt_modality: Modality
 
 
-
 def get_dataloader(dataset, transform):
     dataloader = data.DataLoader(
         dataset,
@@ -113,9 +112,9 @@ def init_transform():
     transform.chat_template = "{% for message in messages %}{{ '<|' + message['role'] + '|>\n'}}{% for content in message['content'] | selectattr('type', 'equalto', 'image') %}{{ '<image>' }}{% endfor %}{% for content in message['content'] | selectattr('type', 'equalto', 'text') %}{{ '\n' + content['text'] + '<|end|>\n' }}{% endfor %}{% endfor %}{% if add_generation_prompt %}{{ '<|assistant|>\n' }}{% endif %}"
     transform.tokenizer.padding_side = "left"
     transform.tokenizer.padding = True
-    model_cfg = LlavaConfig.from_pretrained("xtuner/llava-phi-3-mini-hf")
-    transform.patch_size = model_cfg.vision_config.patch_size
-    transform.vision_feature_select_strategy = model_cfg.vision_feature_select_strategy
+    transform.patch_size = 14
+    transform.num_additional_image_tokens = 1
+    transform.vision_feature_select_strategy = "default"
     return transform
 
 
@@ -138,10 +137,21 @@ def init_model(lora_path):
 
 
 def calculate_score(text_embs, img_embs):
-    text_embs = F.normalize(text_embs, dim=-1)
-    img_embs = F.normalize(img_embs, dim=-1)
-    scores = text_embs @ img_embs.t()
-    return scores
+    score_mode = 'l2'
+    if score_mode == 'l2':
+        distances = rearrange(
+            torch.cdist(
+                rearrange(text_embs, "b d -> 1 b d"),
+                rearrange(img_embs, "b d -> 1 b d"),
+            ),
+            "1 b q -> b q",
+        )
+        return -distances
+    else:
+        text_embs = F.normalize(text_embs, dim=-1)
+        img_embs = F.normalize(img_embs, dim=-1)
+        scores = text_embs @ img_embs.t()
+        return scores
 
 
 def calculate_pos_pairs(text_idx, img_idx):

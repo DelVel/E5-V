@@ -1,7 +1,9 @@
 from itertools import permutations
 
 import numpy as np
+import torch
 from datasets import load_dataset
+from torch.utils.data import Dataset
 
 
 def prompt_text(text):
@@ -210,7 +212,7 @@ def recall_at_k(scores, positive_pairs, k, transpose=False):
     nb_retrieved_positive = positive_pairs.gather(dim, topk_indices).sum(dim=dim)
     recall = nb_retrieved_positive / nb_true_positive
     recall = (recall > 0).float()
-    return recall
+    return recall * 100
 
 
 def custom_collate_fn(batch, transform):
@@ -224,3 +226,30 @@ def custom_collate_fn(batch, transform):
         padding=True,
         padding_side="left",
     ), np.array(indices)
+
+
+def get_cc3m_dataset():
+    cc3m = load_dataset("pixparse/cc3m-wds", split="train")
+    cc3m = cc3m.remove_columns(["__key__", "__url__"])
+    return cc3m
+
+
+def get_cc3m_dataset_with_img_embed():
+    clip_tensor = torch.load("cc3m_clip_emb.pt", weights_only=True, map_location="cpu")
+    cc3m = get_cc3m_dataset()
+    train_data = WrapperDataset(cc3m, clip_tensor)
+    return train_data
+
+
+class WrapperDataset(Dataset):
+    def __init__(self, ds, vec):
+        super().__init__()
+        self.ds = ds
+        self.vec = vec
+        assert len(ds) == len(vec)
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, index):
+        return {"clip_img_embed": self.vec[index], **self.ds[index]}
