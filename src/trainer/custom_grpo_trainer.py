@@ -572,7 +572,7 @@ class CustomGRPOTrainer(Trainer):
                     sampling_params=self.sampling_params,
                     use_tqdm=False,
                 )
-                completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
+                completion_ids = [[x if x != 32038 else 0 for x in out.token_ids] for completions in outputs for out in completions.outputs]
             else:
                 completion_ids = [None] * len(all_prompts_text)
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
